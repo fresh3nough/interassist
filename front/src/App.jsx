@@ -144,6 +144,9 @@ export default function App() {
   const [code, setCode] = useState({ language: '', filename: '', content: '' })
   const [flash, setFlash] = useState('')
   const [flashOn, setFlashOn] = useState(false)
+  const [priorityAnswers, setPriorityAnswers] = useState([])
+  const [pendingQuestions, setPendingQuestions] = useState([])
+  const [queueSize, setQueueSize] = useState(0)
   const [error, setError] = useState('')
   const [manualText, setManualText] = useState('')
   const [debugLine, setDebugLine] = useState('debug: boot')
@@ -412,7 +415,59 @@ export default function App() {
         )
       }
 
+      if (msg.type === 'question_detected' || msg.type === 'question_queued') {
+        const q = String(msg.question || '').trim()
+        logInfo('[priority] question event', msg)
+        if (q) {
+          setPendingQuestions((prev) => {
+            if (prev.some((x) => x.toLowerCase() === q.toLowerCase())) return prev
+            return [q, ...prev].slice(0, 8)
+          })
+        }
+        if (typeof msg.queue_size === 'number') setQueueSize(msg.queue_size)
+        setDebug(`Q priority queued (${msg.queue_size ?? '?'}): ${q.slice(0, 80)}`)
+        setStatus('Priority question queued')
+      }
+
+      if (msg.type === 'priority_answer') {
+        const q = String(msg.question || '').trim()
+        const a = String(msg.answer || '').trim()
+        const pts = Array.isArray(msg.key_points) ? msg.key_points : []
+        logInfo('[priority] answer', { q, a, pts, remaining: msg.queue_remaining })
+        console.log(
+          `%c⚡ PRIORITY Q  ${q}`,
+          'color:#fff; background:#7a1f2b; font-size:14px; font-weight:900; padding:6px 12px; border-radius:8px; border-left:5px solid #ff4d6d'
+        )
+        console.log(
+          `%c⚡ ANSWER  ${a}`,
+          'color:#081018; background:#ffe566; font-size:15px; font-weight:900; padding:6px 12px; border-radius:8px; border-left:5px solid #ffb703'
+        )
+        if (a) {
+          setPriorityAnswers((prev) => {
+            const next = [
+              {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                question: q,
+                answer: a,
+                key_points: pts,
+                ts: msg.ts || Date.now() / 1000,
+              },
+              ...prev,
+            ]
+            return next.slice(0, 12)
+          })
+          setPendingQuestions((prev) => prev.filter((x) => x.toLowerCase() !== q.toLowerCase()))
+          setFlash(a)
+          setFlashOn(true)
+          window.setTimeout(() => setFlashOn(false), 9000)
+        }
+        if (typeof msg.queue_remaining === 'number') setQueueSize(msg.queue_remaining)
+        setStatus('Priority answer ready')
+        setDebug(`priority answer ready · queue left ${msg.queue_remaining ?? 0}`)
+      }
+
       if (msg.type === 'transcript_partial') {
+
         logWarn('[ws] transcript_partial', msg)
         if (msg.note) setStatus(msg.note)
         setDebug(`partial: ${msg.note || msg.text || '(empty)'}`)
@@ -880,6 +935,9 @@ export default function App() {
     setCode({ language: '', filename: '', content: '' })
     setFlash('')
     setFlashOn(false)
+    setPriorityAnswers([])
+    setPendingQuestions([])
+    setQueueSize(0)
     setError('')
     sendJson({ type: 'reset' })
   }
@@ -977,7 +1035,63 @@ export default function App() {
         <span>open DevTools Console for full logs</span>
       </div>
 
+      <section className={`priority-cube ${priorityAnswers.length || pendingQuestions.length ? 'hot' : ''}`}>
+        <div className="priority-cube-head">
+          <div className="priority-title">
+            <span className="priority-orb">Q</span>
+            <div>
+              <h2>Priority answers</h2>
+              <p>Questions jump the queue and answer one-by-one ASAP</p>
+            </div>
+          </div>
+          <div className="priority-meta">
+            <span className={`qbadge ${queueSize > 0 ? 'busy' : ''}`}>
+              queue {queueSize}
+            </span>
+            {pendingQuestions.length ? (
+              <span className="qbadge pending">{pendingQuestions.length} pending</span>
+            ) : null}
+          </div>
+        </div>
+
+        {pendingQuestions.length ? (
+          <div className="pending-row">
+            {pendingQuestions.map((q) => (
+              <div key={q} className="pending-chip">
+                <span className="pending-dot" />
+                <strong>Answering…</strong> {q}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="priority-list">
+          {priorityAnswers.length ? (
+            priorityAnswers.map((item) => (
+              <article key={item.id} className="priority-card">
+                <div className="pq-label">Question</div>
+                <div className="pq-question">{item.question}</div>
+                <div className="pq-label answer-label">Answer</div>
+                <div className="pq-answer">{item.answer}</div>
+                {item.key_points?.length ? (
+                  <ul className="pq-points">
+                    {item.key_points.map((pt) => (
+                      <li key={pt}>{pt}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </article>
+            ))
+          ) : (
+            <p className="priority-empty">
+              When a question is heard, it lands here in bold and gets answered first — before slower panel updates.
+            </p>
+          )}
+        </div>
+      </section>
+
       <main className="grid">
+
         <section className="panel transcript-panel">
           <div className="panel-head">
             <h2>Live transcript</h2>

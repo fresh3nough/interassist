@@ -66,6 +66,39 @@ NOISE_RE = re.compile(
     re.I,
 )
 
+QUESTION_RE = re.compile(
+    r"(?i)(?:"
+    r"\?|"
+    r"\b(?:what|why|how|when|where|who|which|can you|could you|would you|do you|did you|"
+    r"are you|is there|are there|tell me|explain|describe|walk me through|walk us through|"
+    r"give me|show me|define|difference between|compare|trade\-?offs?|complexit(?:y|ies)|"
+    r"big ?o|time complexity|space complexity|how would you|what would you|why did you|"
+    r"have you|what's|whats|how does|how do|please explain)\b"
+    r")"
+)
+
+FAST_ANSWER_PROMPT = """You answer coding-interview questions instantly for a candidate.
+Return ONLY valid JSON (no markdown fences):
+{
+  "question": "the interviewer question rewritten clearly and short",
+  "answer": "bold interview-ready answer, 1-4 short sentences or tight bullets separated by newlines",
+  "key_points": ["up to 4 ultra-short bullets"]
+}
+Rules:
+- Prioritize speed and correctness.
+- If multiple questions appear, answer the latest/most important one.
+- Be direct. No preamble. No fluff.
+"""
+
+
+def _looks_like_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    return bool(QUESTION_RE.search(t))
+
 
 class AnalyzeRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
@@ -258,6 +291,96 @@ async def call_openrouter(
         return result
 
 
+
+async def call_fast_answer(
+    client: httpx.AsyncClient,
+    question_text: str,
+    context: str = "",
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Priority path: answer one question as fast as possible."""
+    selected = (model or OPENROUTER_MODEL).strip() or OPENROUTER_MODEL
+    empty = {"question": question_text.strip(), "answer": "", "key_points": [], "model": selected}
+    if not OPENROUTER_API_KEY:
+        empty["answer"] = "OPENROUTER_API_KEY is missing."
+        return empty
+    body = {
+        "model": selected,
+        "temperature": 0.1,
+        "max_tokens": 450,
+        "messages": [
+            {"role": "system", "content": FAST_ANSWER_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "priority": "ANSWER_NOW",
+                        "latest_question_or_chunk": question_text[-2500:],
+                        "recent_context": context[-4000:],
+                    }
+                ),
+            },
+        ],
+    }
+    try:
+        logger.info(
+            "openrouter FAST answer model=%s q_chars=%s ctx_chars=%s",
+            selected,
+            len(question_text or ""),
+            len(context or ""),
+        )
+        resp = await client.post(
+            f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            headers=_headers(),
+            json=body,
+            timeout=35.0,
+        )
+        logger.info(
+            "openrouter FAST answer status=%s body_preview=%s",
+            resp.status_code,
+            (resp.text or "")[:400],
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        content = payload["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    parts.append(str(item))
+            content = "\n".join(parts)
+        text = str(content or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            data = json.loads(text[start : end + 1]) if start != -1 and end > start else {}
+        q = str(data.get("question") or question_text).strip()
+        ans = str(data.get("answer") or "").strip()
+        pts = data.get("key_points") or []
+        if not isinstance(pts, list):
+            pts = []
+        pts = [str(p).strip() for p in pts if str(p).strip()][:4]
+        if not ans and text:
+            ans = text[:800]
+        logger.info("openrouter FAST answer q=%s a_preview=%s", q[:120], ans[:200])
+        return {"question": q, "answer": ans, "key_points": pts, "model": selected}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("openrouter FAST answer failed: %s", exc)
+        empty["answer"] = f"Fast answer error: {exc}"
+        return empty
+
+
 async def transcribe_audio_chunk(
     client: httpx.AsyncClient,
     audio_b64: str,
@@ -422,6 +545,89 @@ async def interview_ws(ws: WebSocket) -> None:
     analyze_lock = asyncio.Lock()
     last_text = ""
     last_analyze_at = 0.0
+    question_queue: asyncio.Queue[str] = asyncio.Queue()
+    seen_questions: set[str] = set()
+
+    async def priority_answer_worker() -> None:
+        """Drain interview questions FIFO, one-by-one, as fast as possible."""
+        while True:
+            qtext = await question_queue.get()
+            try:
+                ctx = " ".join(full_transcript)[-5000:]
+                logger.info(
+                    "priority queue size_after_get≈%s answering=%s",
+                    question_queue.qsize(),
+                    qtext[:160],
+                )
+                await ws.send_json(
+                    {
+                        "type": "question_queued",
+                        "question": qtext,
+                        "queue_size": question_queue.qsize() + 1,
+                    }
+                )
+                ans = await call_fast_answer(
+                    app.state.http,
+                    question_text=qtext,
+                    context=ctx,
+                    model=model,
+                )
+                await ws.send_json(
+                    {
+                        "type": "priority_answer",
+                        "question": ans.get("question") or qtext,
+                        "answer": ans.get("answer") or "",
+                        "key_points": ans.get("key_points") or [],
+                        "model": ans.get("model") or model,
+                        "queue_remaining": question_queue.qsize(),
+                        "ts": time.time(),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("priority answer worker failed: %s", exc)
+                try:
+                    await ws.send_json(
+                        {
+                            "type": "priority_answer",
+                            "question": qtext,
+                            "answer": f"Priority answer failed: {exc}",
+                            "key_points": [],
+                            "model": model,
+                            "queue_remaining": question_queue.qsize(),
+                            "ts": time.time(),
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                question_queue.task_done()
+
+    worker_task = asyncio.create_task(priority_answer_worker())
+
+    def enqueue_question(text: str) -> None:
+        cleaned = _clean_transcript(text)
+        if not cleaned or not _looks_like_question(cleaned):
+            return
+        key = cleaned.lower()
+        # allow same question again after a while by keeping only recent keys
+        if key in seen_questions:
+            logger.info("priority skip duplicate question: %s", cleaned[:120])
+            return
+        seen_questions.add(key)
+        if len(seen_questions) > 80:
+            # drop arbitrary old entries
+            for _ in range(20):
+                try:
+                    seen_questions.pop()
+                except KeyError:
+                    break
+        question_queue.put_nowait(cleaned)
+        logger.info(
+            "priority enqueued q_chars=%s queue_size=%s text=%s",
+            len(cleaned),
+            question_queue.qsize(),
+            cleaned[:160],
+        )
 
     async def analyze_and_send(text: str, force: bool = False) -> None:
         nonlocal prior_code, last_text, last_analyze_at
@@ -436,17 +642,25 @@ async def interview_ws(ws: WebSocket) -> None:
             )
             return
 
-        # always append new non-empty speech; allow near-duplicates if force
         if cleaned.lower() == last_text.lower() and not force:
             logger.info("skipping exact duplicate transcript: %s", cleaned[:120])
-            # still nudge analysis periodically on silence-ish repeats? no
             return
 
         last_text = cleaned
         full_transcript.append(cleaned)
         joined = " ".join(full_transcript)[-12000:]
 
-        # throttle analyze slightly if bursts, but never drop more than ~1.5s
+        # PRIORITY: questions jump the queue and get a dedicated fast answer path
+        if _looks_like_question(cleaned):
+            enqueue_question(cleaned)
+            await ws.send_json(
+                {
+                    "type": "question_detected",
+                    "question": cleaned,
+                    "queue_size": question_queue.qsize(),
+                }
+            )
+
         now = time.time()
         if not force and (now - last_analyze_at) < 0.4:
             await asyncio.sleep(0.4)
@@ -461,10 +675,16 @@ async def interview_ws(ws: WebSocket) -> None:
                 latest_chunk=cleaned,
             )
             if result.get("code", {}).get("content"):
-                # keep evolving draft even if update flag flaky
                 if result["code"].get("update") or not prior_code:
                     prior_code = result["code"]["content"]
                     result["code"]["update"] = True
+
+            # If detector missed it but full analysis flags a question, enqueue for priority box.
+            if result.get("is_question") or result.get("answer_flash"):
+                if cleaned.lower() not in seen_questions:
+                    q = cleaned if _looks_like_question(cleaned) else (cleaned.rstrip(".!") + "?")
+                    enqueue_question(q)
+
             await ws.send_json(
                 {
                     "type": "analysis",
@@ -554,7 +774,11 @@ async def interview_ws(ws: WebSocket) -> None:
             await ws.send_json({"type": "error", "message": f"Unknown type: {mtype}"})
     except WebSocketDisconnect:
         logger.info("ws disconnected")
+        worker_task.cancel()
         return
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
 
 
 if __name__ == "__main__":
