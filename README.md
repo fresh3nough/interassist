@@ -80,7 +80,7 @@ OPENROUTER_STT_MODEL=openai/whisper-1
 
 If you also have an OpenAI API key, add it to `back/.env`:
 
-```env path=null start=null
+```env
 OPENAI_API_KEY=replace_with_your_openai_key
 OPENAI_REALTIME_MODEL=gpt-live-transcribe
 ```
@@ -107,6 +107,7 @@ interassist/
 ├── back/
 │   ├── main.py             FastAPI app, WebSocket, OpenRouter clients
 │   ├── requirements.txt    Python dependencies
+│   ├── profile_context.txt Candidate context used for personalized answers
 │   └── .env.example        Safe environment template
 ├── front/
 │   ├── src/App.jsx         React interface and microphone lifecycle
@@ -148,13 +149,19 @@ If the microphone does not start:
 
 ## Development checks
 
-```bash path=null start=null
+```bash
 cd front
 npm run build
 
 cd ../back
 python -m py_compile main.py
 ```
+
+## Optional profile context
+
+`back/profile_context.txt` is the candidate context used by the assistant. It contains the candidate's identity, work history, public projects, and interview-answer preferences. The backend loads it once for each WebSocket interview session and also uses it for direct `/api/analyze` requests. The bounded file is sent only as model context and is never sent to the browser.
+
+To use InterAssist for another candidate, replace the contents of `back/profile_context.txt` with that candidate's reviewed facts and preferences, then restart the backend. Keep the file limited to information the candidate has authorized for model use; the application does not fetch remote profile URLs.
 
 ## Privacy and key handling
 
