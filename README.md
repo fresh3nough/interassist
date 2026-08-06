@@ -107,7 +107,7 @@ interassist/
 ├── back/
 │   ├── main.py             FastAPI app, WebSocket, OpenRouter clients
 │   ├── requirements.txt    Python dependencies
-│   ├── profile_context.txt Candidate context used for personalized answers
+│   ├── profile_context.txt Empty candidate context template
 │   └── .env.example        Safe environment template
 ├── front/
 │   ├── src/App.jsx         React interface and microphone lifecycle
@@ -159,9 +159,9 @@ python -m py_compile main.py
 
 ## Optional profile context
 
-`back/profile_context.txt` is the candidate context used by the assistant. It contains the candidate's identity, work history, public projects, and interview-answer preferences. The backend loads it once for each WebSocket interview session and also uses it for direct `/api/analyze` requests. The bounded file is sent only as model context and is never sent to the browser.
+`back/profile_context.txt` is intentionally empty by default. If a candidate wants personalized answers, they can fill it with authorized identity, work history, public projects, and interview-answer preferences. The backend loads it once for each WebSocket interview session and also uses it for direct `/api/analyze` requests. An empty file means no profile context is sent; when populated, the bounded file is sent only as model context and is never sent to the browser.
 
-To use InterAssist for another candidate, replace the contents of `back/profile_context.txt` with that candidate's reviewed facts and preferences, then restart the backend. Keep the file limited to information the candidate has authorized for model use; the application does not fetch remote profile URLs.
+To use InterAssist for a candidate, add that candidate's reviewed facts and preferences to `back/profile_context.txt`, then restart the backend. Keep the file limited to information the candidate has authorized for model use; the application does not fetch remote profile URLs.
 
 ## Privacy and key handling
 
