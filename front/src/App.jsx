@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const DEFAULT_MODEL = 'x-ai/grok-4.5'
+const AUDIO_FALLBACK_CLIP_MS = 2500
 const FALLBACK_MODELS = [
   'x-ai/grok-4.5',
   'x-ai/grok-4',
@@ -176,6 +177,15 @@ export default function App() {
   const recognitionRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
+  const realtimePeerRef = useRef(null)
+  const realtimeChannelRef = useRef(null)
+  const realtimeStreamRef = useRef(null)
+  const realtimeDeltasRef = useRef(new Map())
+  const realtimeCompletedRef = useRef(new Set())
+  const pendingCompletedTranscriptsRef = useRef([])
+  const optimisticTranscriptCountsRef = useRef(new Map())
+  const serverTranscriptCountsRef = useRef(new Map())
+  const realtimeAvailableRef = useRef(null)
   const shouldListenRef = useRef(false)
   const modelRef = useRef(model)
   const transcriptBodyRef = useRef(null)
@@ -247,7 +257,10 @@ export default function App() {
       .then(async (r) => {
         if (!r.ok) return
         const data = await r.json()
-        setDebug(`health ok model=${data.model} has_key=${data.has_key}`)
+        realtimeAvailableRef.current = Boolean(data.realtime_available)
+        setDebug(
+          `health ok model=${data.model} openrouter=${data.has_key} realtime=${data.realtime_available}`,
+        )
       })
       .catch((err) => {
         setError(`Health check failed: ${err.message}`)
@@ -260,6 +273,7 @@ export default function App() {
         const data = await r.json()
         if (Array.isArray(data.models) && data.models.length) setModels(data.models)
         if (data.default_model) setModel(data.default_model)
+        realtimeAvailableRef.current = Boolean(data.realtime_available)
       })
       .catch((err) => logError('[config] load failed', err))
 
@@ -297,6 +311,27 @@ export default function App() {
     }
   }, [])
 
+  // Realtime deltas stay local; only finalized turns enter the slower analysis queue.
+  const sendCompletedTranscript = useCallback(
+    (text) => {
+      const cleaned = String(text || '').replace(/\s+/g, ' ').trim()
+      if (!cleaned) return
+
+      const key = cleaned.toLowerCase()
+      optimisticTranscriptCountsRef.current.set(
+        key,
+        (optimisticTranscriptCountsRef.current.get(key) || 0) + 1,
+      )
+      setTranscript((prev) => appendLiveTranscript(prev, cleaned))
+      setLiveLine('')
+
+      if (!sendJson({ type: 'transcript', text: cleaned })) {
+        pendingCompletedTranscriptsRef.current.push(cleaned)
+        logWarn('[realtime] completed turn queued until ws opens', cleaned)
+      }
+    },
+    [appendLiveTranscript, sendJson],
+  )
   const connectWs = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= 1) {
       logInfo('[ws] already connecting/open', { readyState: wsRef.current.readyState })
@@ -323,6 +358,11 @@ export default function App() {
       setError('')
       setDebug('ws open')
       sendJson({ type: 'config', model: modelRef.current })
+      const pending = pendingCompletedTranscriptsRef.current.splice(0)
+      if (pending.length) {
+        logInfo('[ws] flushing completed Realtime turns', { count: pending.length })
+        pending.forEach((text) => sendJson({ type: 'transcript', text }))
+      }
     }
 
     ws.onclose = (ev) => {
@@ -391,11 +431,43 @@ export default function App() {
             : msg,
       })
 
+      if (msg.type === 'transcript') {
+        const chunk = String(msg.transcript || '').trim()
+        if (chunk) {
+          logSubtitle('server', chunk)
+          const key = chunk.toLowerCase()
+          serverTranscriptCountsRef.current.set(
+            key,
+            (serverTranscriptCountsRef.current.get(key) || 0) + 1,
+          )
+          setTranscript((prev) => appendLiveTranscript(prev, chunk))
+          setLiveLine('')
+          setStatus('Listening')
+          setDebug(`transcript seq=${msg.sequence ?? '?'}`)
+        }
+        return
+      }
+
       if (msg.type === 'analysis') {
         const chunk = (msg.transcript || '').trim()
         if (chunk) {
           logSubtitle('server', chunk)
-          setTranscript((prev) => appendLiveTranscript(prev, chunk))
+          const key = chunk.toLowerCase()
+          const serverCount = serverTranscriptCountsRef.current.get(key) || 0
+          if (serverCount > 0) {
+            if (serverCount === 1) serverTranscriptCountsRef.current.delete(key)
+            else serverTranscriptCountsRef.current.set(key, serverCount - 1)
+            logInfo('[transcript] server echo reconciled', chunk)
+          } else {
+            const optimisticCount = optimisticTranscriptCountsRef.current.get(key) || 0
+            if (optimisticCount > 0) {
+              if (optimisticCount === 1) optimisticTranscriptCountsRef.current.delete(key)
+              else optimisticTranscriptCountsRef.current.set(key, optimisticCount - 1)
+              logInfo('[transcript] Realtime echo reconciled', chunk)
+            } else {
+              setTranscript((prev) => appendLiveTranscript(prev, chunk))
+            }
+          }
           setLiveLine('')
         }
         if (msg.summary) {
@@ -559,6 +631,32 @@ export default function App() {
     }
     usingSpeechRef.current = false
   }, [])
+  const stopRealtime = useCallback(() => {
+    realtimeCompletedRef.current.clear()
+    realtimeDeltasRef.current.clear()
+    if (realtimeChannelRef.current) {
+      try {
+        realtimeChannelRef.current.close()
+      } catch (err) {
+        logWarn('[realtime] data channel close threw', err)
+      }
+      realtimeChannelRef.current = null
+    }
+    if (realtimePeerRef.current) {
+      try {
+        realtimePeerRef.current.close()
+      } catch (err) {
+        logWarn('[realtime] peer connection close threw', err)
+      }
+      realtimePeerRef.current = null
+    }
+    if (realtimeStreamRef.current) {
+      const tracks = realtimeStreamRef.current.getTracks()
+      logInfo('[realtime] stopping tracks', tracks.map((t) => ({ label: t.label, readyState: t.readyState })))
+      tracks.forEach((track) => track.stop())
+      realtimeStreamRef.current = null
+    }
+  }, [])
 
   const stopMic = useCallback(() => {
     logInfo('[mic] stop requested')
@@ -570,6 +668,7 @@ export default function App() {
       audioCycleTimerRef.current = null
     }
     stopSpeechOnly()
+    stopRealtime()
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       logInfo('[audio] stopping MediaRecorder', { state: mediaRecorderRef.current.state })
@@ -591,7 +690,7 @@ export default function App() {
 
     setStatus(connected ? 'Connected' : 'Idle')
     setDebug('mic stopped')
-  }, [connected, setDebug, stopSpeechOnly])
+  }, [connected, setDebug, stopRealtime, stopSpeechOnly])
 
   const startAudioFallback = useCallback(async (reason = 'manual') => {
     if (audioFallbackStartedRef.current) {
@@ -751,13 +850,17 @@ export default function App() {
               logWarn('[audio] stop cycle threw', err)
             }
           }
-        }, 5000)
+        }, AUDIO_FALLBACK_CLIP_MS)
       }
 
       startCycle()
-      setStatus('Listening (Whisper every 5s → Grok live)')
+      setStatus(
+        reason.includes('openrouter-only') || reason.includes('OPENAI_API_KEY')
+          ? 'Listening (OpenRouter Whisper fallback)'
+          : `Listening (Whisper clips every ${AUDIO_FALLBACK_CLIP_MS / 1000}s)`,
+      )
       setListening(true)
-      logInfo('[audio] fallback listening active — complete clips every 5s')
+      logInfo('[audio] fallback listening active — complete clips every %sms', AUDIO_FALLBACK_CLIP_MS)
     } catch (err) {
       audioFallbackStartedRef.current = false
       logError('[audio] fallback failed', {
@@ -771,6 +874,177 @@ export default function App() {
       throw err
     }
   }, [sendJson, setDebug])
+
+  // Capture browser audio over WebRTC so OpenAI can emit transcript deltas without file chunks.
+  const startRealtime = useCallback(async () => {
+    if (typeof RTCPeerConnection === 'undefined') {
+      throw new Error('WebRTC is not supported in this browser')
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('getUserMedia unavailable (use localhost or HTTPS)')
+    }
+
+    stopRealtime()
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    })
+    realtimeStreamRef.current = stream
+    logInfo('[realtime] microphone stream ready', {
+      tracks: stream.getAudioTracks().map((track) => ({
+        label: track.label,
+        settings: track.getSettings?.(),
+      })),
+    })
+
+    const peer = new RTCPeerConnection()
+    const channel = peer.createDataChannel('oai-events')
+    realtimePeerRef.current = peer
+    realtimeChannelRef.current = channel
+    stream.getTracks().forEach((track) => peer.addTrack(track, stream))
+
+    const startFallback = (reason) => {
+      if (!shouldListenRef.current || audioFallbackStartedRef.current) return
+      logWarn('[realtime] falling back to complete-file transcription', reason)
+      stopRealtime()
+      startAudioFallback(reason).catch((fallbackError) => {
+        logError('[realtime] fallback failed', fallbackError)
+        setError(`Realtime and audio fallback failed: ${fallbackError.message || fallbackError}`)
+        setListening(false)
+      })
+    }
+
+    peer.onconnectionstatechange = () => {
+      const state = peer.connectionState
+      logInfo('[realtime] connection state', state)
+      if (state === 'failed') startFallback('realtime-connection-failed')
+      if (state === 'disconnected') {
+        window.setTimeout(() => {
+          if (peer.connectionState === 'disconnected') startFallback('realtime-connection-disconnected')
+        }, 1500)
+      }
+    }
+
+    channel.onopen = () => {
+      logInfo('[realtime] data channel open')
+      setStatus('Listening (OpenAI Realtime)')
+      setListening(true)
+      setDebug('OpenAI Realtime connected')
+    }
+
+    channel.onclose = () => {
+      logWarn('[realtime] data channel closed', {
+        shouldListen: shouldListenRef.current,
+        connectionState: peer.connectionState,
+      })
+      if (shouldListenRef.current && peer.connectionState !== 'closed') {
+        startFallback('realtime-data-channel-closed')
+      }
+    }
+
+    channel.onerror = (event) => {
+      logError('[realtime] data channel error', event)
+      setError('OpenAI Realtime data channel error')
+    }
+    channel.onmessage = (event) => {
+      let message
+      try {
+        message = JSON.parse(event.data)
+      } catch (err) {
+        logError('[realtime] invalid event JSON', { raw: String(event.data).slice(0, 500), err })
+        return
+      }
+      logInfo('[realtime] event', {
+        type: message.type,
+        item_id: message.item_id,
+        delta_chars: message.delta?.length,
+        transcript_chars: message.transcript?.length,
+      })
+
+      if (message.type === 'conversation.item.input_audio_transcription.delta') {
+        const itemId = message.item_id || 'current'
+        const current = `${realtimeDeltasRef.current.get(itemId) || ''}${message.delta || ''}`.trim()
+        realtimeDeltasRef.current.set(itemId, current)
+        if (current) {
+          setLiveLine(current)
+          logSubtitle('interim', current)
+        }
+        return
+      }
+
+      if (message.type === 'conversation.item.input_audio_transcription.completed') {
+        const itemId = message.item_id || `completed-${Date.now()}`
+        if (realtimeCompletedRef.current.has(itemId)) return
+        realtimeCompletedRef.current.add(itemId)
+        const finalText = String(
+          message.transcript || realtimeDeltasRef.current.get(itemId) || '',
+        ).trim()
+        realtimeDeltasRef.current.delete(itemId)
+        if (!finalText) return
+        logSubtitle('final', finalText)
+        sendCompletedTranscript(finalText)
+        setStatus('Realtime turn complete · analyzing')
+        return
+      }
+
+      if (message.type === 'error') {
+        const detail = message.error?.message || message.message || 'OpenAI Realtime error'
+        logError('[realtime] server error', message)
+        setError(detail)
+        startFallback(`realtime-server-error:${detail}`)
+      }
+    }
+
+    try {
+      const offer = await peer.createOffer()
+      await peer.setLocalDescription(offer)
+      if (!peer.localDescription?.sdp) throw new Error('WebRTC SDP offer was empty')
+
+      const response = await debugFetch('/api/realtime/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: peer.localDescription.sdp,
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(`Realtime session ${response.status}: ${detail.slice(0, 300)}`)
+      }
+      const answerSdp = await response.text()
+      if (!answerSdp.trim()) throw new Error('Realtime SDP answer was empty')
+      await peer.setRemoteDescription({ type: 'answer', sdp: answerSdp })
+      logInfo('[realtime] remote description applied')
+      setStatus('Connecting OpenAI Realtime…')
+      setListening(true)
+    } catch (err) {
+      logError('[realtime] setup failed', {
+        error: String(err),
+        name: err?.name,
+        message: err?.message,
+        stack: err?.stack,
+      })
+      stopRealtime()
+      if (!shouldListenRef.current) throw err
+      try {
+        await startAudioFallback(`realtime-setup-failed:${err.message || err}`)
+        if (/OPENAI_API_KEY is missing/i.test(err.message || '')) {
+          setError('')
+          setDebug('OpenAI Realtime key unavailable; using OpenRouter Whisper')
+        } else {
+          setError(`Realtime unavailable; using file fallback: ${err.message || err}`)
+        }
+        return false
+      } catch (fallbackError) {
+        throw new Error(
+          `Realtime setup failed (${err.message || err}); fallback failed (${fallbackError.message || fallbackError})`,
+        )
+      }
+    }
+    return true
+  }, [sendCompletedTranscript, setDebug, startAudioFallback, stopRealtime])
 
   const startBrowserSpeech = useCallback(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
@@ -917,47 +1191,40 @@ export default function App() {
     }
 
     try {
-      // Probe mic first so we fail early with a clear error
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('getUserMedia unavailable (needs secure context / permissions)')
+      if (realtimeAvailableRef.current === false) {
+        logInfo('[mic] OpenAI Realtime unavailable; using OpenRouter key for audio fallback')
+        await startAudioFallback('openrouter-only-mode')
+        setError('')
+        return
       }
-      const probe = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: true,
-        },
-      })
-      logInfo('[mic] permission/probe ok', {
-        tracks: probe.getTracks().map((t) => ({ label: t.label, readyState: t.readyState, settings: t.getSettings?.() })),
-      })
-      // Keep stream for level / fallback; speech API uses its own capture too
-      mediaStreamRef.current = probe
-
-      // Prefer complete 5s Whisper clips for reliable nearby-speaker capture.
-      // Web Speech API is flaky (network errors) and often misses continuous audio.
-      logWarn('[mic] starting Whisper complete-clip mode (primary)')
-      // stop probe tracks; startAudioFallback opens a fresh optimized stream
-      try {
-        probe.getTracks().forEach((tr) => tr.stop())
-      } catch {
-        /* ignore */
+      const realtimeStarted = await startRealtime()
+      if (realtimeStarted !== false) {
+        setStatus('Listening (OpenAI Realtime)')
+        setListening(true)
       }
-      mediaStreamRef.current = null
-      await startAudioFallback('primary-whisper-cycle')
     } catch (err) {
-      shouldListenRef.current = false
-      setListening(false)
       logError('[mic] start failed', {
         err: String(err),
         name: err?.name,
         message: err?.message,
         stack: err?.stack,
       })
+      stopRealtime()
+      if (err?.name !== 'NotAllowedError' && err?.name !== 'PermissionDeniedError') {
+        try {
+          await startAudioFallback(`realtime-start-failed:${err.message || err}`)
+          setError(`Realtime unavailable; using file fallback: ${err.message || err}`)
+          return
+        } catch (fallbackError) {
+          logError('[mic] fallback after Realtime start failure failed', fallbackError)
+        }
+      }
+      shouldListenRef.current = false
+      setListening(false)
       setError(err?.message || 'Could not start microphone')
       setDebug(`mic start failed: ${err?.message || err}`)
     }
-  }, [connectWs, setDebug, startAudioFallback, startBrowserSpeech])
+  }, [connectWs, setDebug, startAudioFallback, startRealtime, stopRealtime])
 
   const resetSession = () => {
     logInfo('[session] reset')
@@ -972,6 +1239,11 @@ export default function App() {
     setPendingQuestions([])
     setQueueSize(0)
     setError('')
+    realtimeDeltasRef.current.clear()
+    realtimeCompletedRef.current.clear()
+    optimisticTranscriptCountsRef.current.clear()
+    serverTranscriptCountsRef.current.clear()
+    pendingCompletedTranscriptsRef.current = []
     sendJson({ type: 'reset' })
   }
 
@@ -1000,6 +1272,7 @@ export default function App() {
     logWarn('[ui] force audio mode clicked')
     shouldListenRef.current = true
     stopSpeechOnly()
+    stopRealtime()
     try {
       await startAudioFallback('user-forced')
       setListening(true)
@@ -1007,6 +1280,7 @@ export default function App() {
       setError(err.message || String(err))
     }
   }
+  useEffect(() => () => stopRealtime(), [stopRealtime])
 
   return (
     <div className="app">
@@ -1138,8 +1412,9 @@ export default function App() {
               </>
             ) : (
               <p className="empty">
-                Press Start listening. If you see Speech error: network, the app auto-falls back to mic
-                audio chunks (or click Force audio mode). Watch the browser console for every word/chunk.
+                Press Start listening for low-latency OpenAI Realtime captions. If Realtime setup fails,
+                the app automatically falls back to complete audio files; Force audio mode starts that
+                fallback directly.
               </p>
             )}
           </div>

@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 try:
@@ -42,9 +42,45 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.5")
 OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-1")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-live-transcribe")
+OPENAI_REALTIME_URL = "https://api.openai.com/v1/realtime/calls"
+
+REALTIME_SESSION_CONFIG = {
+    "type": "transcription",
+    "audio": {
+        "input": {
+            "transcription": {
+                "model": OPENAI_REALTIME_MODEL,
+                "languages": ["en"],
+                "delay": "low",
+                "keywords": [
+                    "OpenRouter",
+                    "OpenAI",
+                    "Grok",
+                    "FastAPI",
+                    "WebSocket",
+                    "WebRTC",
+                    "React",
+                    "TypeScript",
+                    "JavaScript",
+                    "Python",
+                    "GitHub",
+                    "Apollo Art",
+                ],
+            },
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 350,
+            },
+        }
+    },
+}
 
 SYSTEM_PROMPT = """You are InterAssist, a live coding-interview co-pilot agent.
-You receive the rolling conversation transcript from Whisper speech-to-text.
+You receive the rolling conversation transcript from live speech-to-text.
 
 Every time you are called, refresh ALL panels for the candidate RIGHT NOW based on the latest transcript.
 
@@ -110,6 +146,22 @@ NOISE_RE = re.compile(
     r"please subscribe[.!]?|music|\[music\]|\(music\)|\.|\.\.\.|…)$",
     re.I,
 )
+HALLUCINATED_CLOSING_RE = re.compile(
+    r"(?i)(?:"
+    r"\bthank you(?: so much)? for watching\b|"
+    r"\b(?:i hope you have a wonderful day|i'll see you in the next video)\b|"
+    r"\b(?:and )?prince,? happy birthday\b"
+    r")"
+)
+ACKNOWLEDGEMENT_RE = re.compile(
+    r"^(?:thanks?|thank you|thank you so much|okay|ok|great|awesome|perfect|"
+    r"sounds good|no problem|right|got it|hello|hi|hey)[.!?,\\s]*$",
+    re.I,
+)
+INCOMPLETE_END_RE = re.compile(
+    r"(?i)(?:\b(?:a|an|the|and|or|but|because|so|to|for|of|in|on|with|"
+    r"from|about|that|which|me|you|my|your|is|are|can|could|would))$"
+)
 FRAGMENT_PREFIX_RE = re.compile(
     r"^(?:and|or|but|because|so|then|also|as|that|which)\b",
     re.I,
@@ -171,6 +223,8 @@ def _question_evidence(text: str) -> tuple[bool, dict[str, Any]]:
         "sentiment_compound": 0.0,
         "reason": "empty",
     }
+
+
     if not t:
         return False, evidence
     normalized = re.sub(r"[.!?,\s]+$", "", t).strip()
@@ -182,6 +236,9 @@ def _question_evidence(text: str) -> tuple[bool, dict[str, Any]]:
         return False, evidence
     if FRAGMENT_PREFIX_RE.match(normalized):
         evidence["reason"] = "conjunction_fragment"
+        return False, evidence
+    if _is_incomplete_fragment(normalized) and "?" not in t:
+        evidence["reason"] = "incomplete_fragment"
         return False, evidence
     if len(re.sub(r"[^a-z0-9]+", "", normalized.lower())) < 3:
         evidence["reason"] = "too_short"
@@ -336,11 +393,32 @@ def _clean_transcript(text: str) -> str:
     t = " ".join((text or "").split()).strip()
     if not t:
         return ""
-    if NOISE_RE.match(t):
+    if NOISE_RE.match(t) or HALLUCINATED_CLOSING_RE.search(t):
         return ""
-    if len(t) < 1:
+    if ACKNOWLEDGEMENT_RE.fullmatch(t):
         return ""
     return t
+
+
+def _is_incomplete_fragment(text: str) -> bool:
+    """Avoid treating a clipped recorder segment as a complete question."""
+    normalized = re.sub(r"[.!?,\s]+$", "", text or "").strip()
+    if not normalized:
+        return True
+    return bool(INCOMPLETE_END_RE.search(normalized))
+
+
+def _should_analyze(text: str) -> bool:
+    """Skip filler and sentence fragments while retaining them in the transcript."""
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized or ACKNOWLEDGEMENT_RE.fullmatch(normalized):
+        return False
+    if HALLUCINATED_CLOSING_RE.search(normalized):
+        return False
+    words = re.findall(r"[A-Za-z0-9']+", normalized)
+    if len(words) <= 5 and _is_incomplete_fragment(normalized):
+        return False
+    return True
 
 
 async def call_openrouter(
@@ -626,6 +704,8 @@ async def health() -> dict[str, Any]:
         "model": OPENROUTER_MODEL,
         "stt_model": OPENROUTER_STT_MODEL,
         "has_key": bool(OPENROUTER_API_KEY),
+        "realtime_model": OPENAI_REALTIME_MODEL,
+        "realtime_available": bool(OPENAI_API_KEY),
     }
 
 
@@ -634,6 +714,8 @@ async def config() -> dict[str, Any]:
     return {
         "default_model": OPENROUTER_MODEL,
         "stt_model": OPENROUTER_STT_MODEL,
+        "realtime_model": OPENAI_REALTIME_MODEL,
+        "realtime_available": bool(OPENAI_API_KEY),
         "models": [
             "x-ai/grok-4.5",
             "x-ai/grok-4",
@@ -643,6 +725,72 @@ async def config() -> dict[str, Any]:
             "google/gemini-2.5-flash",
         ],
     }
+
+
+@app.post("/api/realtime/session")
+async def create_realtime_session(
+    sdp: str = Body(..., media_type="application/sdp"),
+) -> Response:
+    """Proxy a browser SDP offer to OpenAI without exposing the server API key."""
+    if not OPENAI_API_KEY:
+        logger.warning("realtime session requested but OPENAI_API_KEY is missing")
+        return Response(
+            content="OPENAI_API_KEY is missing.",
+            status_code=503,
+            media_type="text/plain",
+        )
+    if not sdp.strip():
+        return Response(
+            content="SDP offer is empty.",
+            status_code=400,
+            media_type="text/plain",
+        )
+
+    files = [
+        ("sdp", (None, sdp, "application/sdp")),
+        (
+            "session",
+            (None, json.dumps(REALTIME_SESSION_CONFIG), "application/json"),
+        ),
+    ]
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Accept": "application/sdp",
+    }
+    try:
+        logger.info(
+            "realtime session request model=%s sdp_chars=%s",
+            OPENAI_REALTIME_MODEL,
+            len(sdp),
+        )
+        response = await app.state.http.post(
+            OPENAI_REALTIME_URL,
+            headers=headers,
+            files=files,
+            timeout=30.0,
+        )
+        logger.info(
+            "realtime session response status=%s body_chars=%s",
+            response.status_code,
+            len(response.content),
+        )
+        content_type = response.headers.get("content-type", "application/sdp")
+        response_headers = {}
+        if response.headers.get("location"):
+            response_headers["Location"] = response.headers["location"]
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=content_type.split(";", 1)[0],
+            headers=response_headers,
+        )
+    except httpx.HTTPError as exc:
+        logger.exception("realtime session request failed: %s", exc)
+        return Response(
+            content=f"Realtime session request failed: {exc}",
+            status_code=502,
+            media_type="text/plain",
+        )
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)
@@ -665,11 +813,12 @@ async def interview_ws(ws: WebSocket) -> None:
     model = OPENROUTER_MODEL
     stt_model = OPENROUTER_STT_MODEL
     last_text = ""
-    last_analyze_at = 0.0
+    latest_sequence = 0
+    latest_analysis_sequence = 0
     connection_open = True
     send_lock = asyncio.Lock()
-    audio_queue: asyncio.Queue[tuple[int, str, str]] = asyncio.Queue(maxsize=32)
-    transcript_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue(maxsize=64)
+    audio_queue: asyncio.Queue[tuple[int, str, str]] = asyncio.Queue(maxsize=3)
+    transcript_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue(maxsize=2)
     question_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=32)
     seen_questions: set[str] = set()
     answered_questions: set[str] = set()
@@ -776,7 +925,7 @@ async def interview_ws(ws: WebSocket) -> None:
 
     worker_task = asyncio.create_task(priority_answer_worker())
 
-    def enqueue_question(text: str) -> None:
+    def enqueue_question(text: str) -> bool:
         cleaned = _clean_transcript(text)
         accepted, evidence = _question_evidence(cleaned)
         logger.info(
@@ -790,12 +939,12 @@ async def interview_ws(ws: WebSocket) -> None:
             cleaned[:160],
         )
         if not cleaned or not accepted:
-            return
+            return False
         key = cleaned.lower()
         # allow same question again after a while by keeping only recent keys
         if key in seen_questions:
             logger.info("priority skip duplicate question: %s", cleaned[:120])
-            return
+            return False
         seen_questions.add(key)
         if len(seen_questions) > 80:
             # drop arbitrary old entries
@@ -808,51 +957,77 @@ async def interview_ws(ws: WebSocket) -> None:
             question_queue.put_nowait(cleaned)
         except asyncio.QueueFull:
             logger.warning("priority queue full; dropping question: %s", cleaned[:160])
-            return
+            return False
         logger.info(
             "priority enqueued q_chars=%s queue_size=%s text=%s",
             len(cleaned),
             question_queue.qsize(),
             cleaned[:160],
         )
+        return True
 
-    async def analyze_and_send(text: str, force: bool = False) -> None:
-        nonlocal prior_code, last_text, last_analyze_at
+    def queue_latest_analysis(seq: int, text: str) -> None:
+        """Keep at most one panel update waiting behind the current model call."""
+        nonlocal latest_analysis_sequence
+        latest_analysis_sequence = seq
+        while True:
+            try:
+                transcript_queue.get_nowait()
+                transcript_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            transcript_queue.put_nowait((seq, text))
+        except asyncio.QueueFull:
+            logger.warning("analysis queue full; dropping stale seq=%s", seq)
+
+    async def publish_transcript(seq: int, text: str) -> str:
+        """Commit a recognized line to the rolling transcript before AI analysis."""
+        nonlocal last_text, latest_sequence
         cleaned = _clean_transcript(text)
         if not cleaned:
-            await safe_send(
-                {
-                    "type": "transcript_partial",
-                    "text": "",
-                    "note": "No speech detected in chunk",
-                }
-            )
-            return
+            return ""
 
-        if cleaned.lower() == last_text.lower() and not force:
+        if cleaned.lower() == last_text.lower():
             logger.info("skipping exact duplicate transcript: %s", cleaned[:120])
-            return
+            return ""
 
         last_text = cleaned
+        latest_sequence = seq
         full_transcript.append(cleaned)
         joined = " ".join(full_transcript)[-12000:]
+        await safe_send(
+            {
+                "type": "transcript",
+                "transcript": cleaned,
+                "full_transcript": joined,
+                "sequence": seq,
+            }
+        )
 
         # PRIORITY: questions jump the queue and get a dedicated fast answer path
-        if _looks_like_question(cleaned):
-            enqueue_question(cleaned)
+        if enqueue_question(cleaned):
             await safe_send(
                 {
                     "type": "question_detected",
                     "question": cleaned,
                     "queue_size": question_queue.qsize(),
+                    "sequence": seq,
                 }
             )
 
-        now = time.time()
-        if not force and (now - last_analyze_at) < 0.4:
-            await asyncio.sleep(0.4)
+        if _should_analyze(cleaned):
+            queue_latest_analysis(seq, cleaned)
+        else:
+            logger.info("skipping panel analysis for filler/fragment seq=%s text=%s", seq, cleaned[:120])
+        return cleaned
 
-        last_analyze_at = time.time()
+    async def analyze_and_send(seq: int, text: str) -> None:
+        nonlocal prior_code
+        cleaned = _clean_transcript(text)
+        if not cleaned or not _should_analyze(cleaned):
+            return
+        joined = " ".join(full_transcript)[-12000:]
         result = await call_openrouter(
             app.state.http,
             transcript=joined,
@@ -860,28 +1035,26 @@ async def interview_ws(ws: WebSocket) -> None:
             model=model,
             latest_chunk=cleaned,
         )
+        # A newer meaningful line arrived while this request was in flight.
+        # Do not let an old model response overwrite the current panels.
+        if seq != latest_analysis_sequence:
+            logger.info(
+                "discarding stale panel analysis seq=%s latest_analysis_seq=%s",
+                seq,
+                latest_analysis_sequence,
+            )
+            return
         if result.get("code", {}).get("content"):
             if result["code"].get("update") or not prior_code:
                 prior_code = result["code"]["content"]
                 result["code"]["update"] = True
-
-        # If detector missed it but full analysis flags a question, enqueue for priority box.
-        if result.get("is_question") and _looks_like_question(cleaned):
-            if cleaned.lower() not in seen_questions:
-                enqueue_question(cleaned)
-            if result.get("answer_flash"):
-                await publish_priority_answer(
-                    cleaned,
-                    str(result["answer_flash"]),
-                    result.get("talking_points") or [],
-                    result.get("model") or model,
-                )
 
         await safe_send(
             {
                 "type": "analysis",
                 "transcript": cleaned,
                 "full_transcript": joined,
+                "sequence": seq,
                 **result,
             }
         )
@@ -908,7 +1081,7 @@ async def interview_ws(ws: WebSocket) -> None:
                         }
                     )
                 elif text:
-                    await transcript_queue.put((seq, text))
+                    await publish_transcript(seq, text)
                 else:
                     await safe_send(
                         {
@@ -937,7 +1110,7 @@ async def interview_ws(ws: WebSocket) -> None:
             seq, text = await transcript_queue.get()
             try:
                 logger.info("analysis queue processing seq=%s text=%s", seq, text[:160])
-                await analyze_and_send(text, force=True)
+                await analyze_and_send(seq, text)
             except Exception as exc:  # noqa: BLE001
                 if connection_open:
                     logger.exception("analysis worker failed seq=%s: %s", seq, exc)
@@ -981,6 +1154,8 @@ async def interview_ws(ws: WebSocket) -> None:
                 full_transcript = []
                 prior_code = ""
                 last_text = ""
+                latest_sequence = 0
+                latest_analysis_sequence = 0
                 seen_questions.clear()
                 answered_questions.clear()
                 await safe_send({"type": "reset_ok"})
@@ -992,7 +1167,7 @@ async def interview_ws(ws: WebSocket) -> None:
                 if not text:
                     continue
                 sequence += 1
-                await transcript_queue.put((sequence, text))
+                await publish_transcript(sequence, text)
                 continue
 
             if mtype == "audio_chunk":
@@ -1009,7 +1184,14 @@ async def interview_ws(ws: WebSocket) -> None:
                     )
                     continue
                 sequence += 1
-                await audio_queue.put((sequence, audio_b64, mime_type))
+                if audio_queue.full():
+                    try:
+                        dropped_seq, _, _ = audio_queue.get_nowait()
+                        audio_queue.task_done()
+                        logger.warning("dropping stale audio seq=%s to avoid backlog", dropped_seq)
+                    except asyncio.QueueEmpty:
+                        pass
+                audio_queue.put_nowait((sequence, audio_b64, mime_type))
                 await safe_send(
                     {
                         "type": "audio_queued",

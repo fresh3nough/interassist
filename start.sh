@@ -79,6 +79,16 @@ echo "==> frontend deps"
   fi
 )
 
+stop_process_tree() {
+  local pid="$1"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    stop_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+STOP_REQUESTED=0
+
 cleanup() {
   echo
   echo "==> stopping…"
@@ -90,14 +100,26 @@ cleanup() {
   fi
   for log_pid in "${BACK_LOG_PID:-}" "${FRONT_LOG_PID:-}" "${DAILY_TAIL_PID:-}"; do
     if [[ -n "$log_pid" ]] && kill -0 "$log_pid" 2>/dev/null; then
-      kill "$log_pid" 2>/dev/null || true
+      stop_process_tree "$log_pid"
     fi
   done
   # child process groups if any linger
   wait 2>/dev/null || true
   echo "==> stopped"
 }
-trap cleanup INT TERM EXIT
+trap 'STOP_REQUESTED=1' INT TERM
+trap cleanup EXIT
+
+# A previous interrupted shell can orphan tail -F children. Remove only the
+# streamers owned by this project before creating the fresh pair.
+for source in "$LOG_DIR/back.log" "$LOG_DIR/front.log"; do
+  stale_pids="$(ps -axo pid=,command= | awk -v source="$source" '$0 ~ ("tail -n +1 -F " source "$") {print $1}')"
+  if [[ -n "$stale_pids" ]]; then
+    echo "==> removing stale log streamers: $stale_pids"
+    # shellcheck disable=SC2086
+    kill $stale_pids 2>/dev/null || true
+  fi
+done
 
 start_daily_log_stream BACK "$LOG_DIR/back.log" &
 BACK_LOG_PID=$!
@@ -172,11 +194,14 @@ echo
 tail -n 0 -F "$DAILY_LOG" &
 DAILY_TAIL_PID=$!
 
-while kill -0 "$BACK_PID" 2>/dev/null && kill -0 "$FRONT_PID" 2>/dev/null; do
+while [[ "$STOP_REQUESTED" -eq 0 ]] && kill -0 "$BACK_PID" 2>/dev/null && kill -0 "$FRONT_PID" 2>/dev/null; do
   sleep 1
 done
 
 kill "$DAILY_TAIL_PID" 2>/dev/null || true
+if [[ "$STOP_REQUESTED" -eq 1 ]]; then
+  exit 0
+fi
 
 if ! kill -0 "$BACK_PID" 2>/dev/null; then
   echo "error: backend stopped — see $LOG_DIR/back.log"
