@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 import os
 from contextlib import asynccontextmanager
@@ -14,6 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [InterAssist] %(levelname)s %(message)s",
+)
+logger = logging.getLogger("interassist")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.5")
@@ -161,17 +168,33 @@ async def call_openrouter(
     }
 
     try:
+        logger.info(
+            "openrouter analyze model=%s transcript_chars=%s prior_code_chars=%s",
+            selected,
+            len(transcript or ""),
+            len(prior_code or ""),
+        )
         resp = await client.post(
             f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
             headers=headers,
             json=body,
             timeout=60.0,
         )
+        logger.info(
+            "openrouter analyze status=%s body_preview=%s",
+            resp.status_code,
+            (resp.text or "")[:500],
+        )
         resp.raise_for_status()
         payload = resp.json()
         content = payload["choices"][0]["message"]["content"]
+        logger.info(
+            "openrouter analyze content_preview=%s",
+            str(content)[:400],
+        )
         return _parse_model_json(content, selected)
     except Exception as exc:  # noqa: BLE001 - surface soft failure to UI
+        logger.exception("openrouter analyze failed: %s", exc)
         result = _empty_result(selected)
         result["transcript_note"] = f"OpenRouter error: {exc}"
         return result
@@ -226,11 +249,22 @@ async def transcribe_audio_chunk(
     }
 
     try:
+        logger.info(
+            "openrouter transcribe model=%s audio_b64_len=%s mime=%s",
+            selected,
+            len(audio_b64 or ""),
+            mime_type,
+        )
         resp = await client.post(
             f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
             headers=headers,
             json=body,
             timeout=90.0,
+        )
+        logger.info(
+            "openrouter transcribe status=%s body_preview=%s",
+            resp.status_code,
+            (resp.text or "")[:500],
         )
         resp.raise_for_status()
         payload = resp.json()
@@ -242,9 +276,13 @@ async def transcribe_audio_chunk(
                     parts.append(str(item.get("text") or ""))
                 else:
                     parts.append(str(item))
-            return " ".join(p.strip() for p in parts if p and str(p).strip()).strip()
-        return str(content or "").strip()
-    except Exception:
+            text = " ".join(p.strip() for p in parts if p and str(p).strip()).strip()
+        else:
+            text = str(content or "").strip()
+        logger.info("openrouter transcribe text_preview=%s", text[:300])
+        return text
+    except Exception as exc:
+        logger.exception("openrouter transcribe failed: %s", exc)
         return ""
 
 
@@ -317,6 +355,11 @@ async def interview_ws(ws: WebSocket) -> None:
                 continue
 
             mtype = msg.get("type")
+            logger.info(
+                "ws recv type=%s keys=%s",
+                mtype,
+                list(msg.keys()),
+            )
 
             if mtype == "config":
                 model = (msg.get("model") or model).strip() or model
@@ -331,6 +374,7 @@ async def interview_ws(ws: WebSocket) -> None:
 
             if mtype == "transcript":
                 text = str(msg.get("text") or "").strip()
+                logger.info("ws transcript text=%s", text[:300])
                 if not text:
                     continue
                 full_transcript.append(text)
@@ -356,6 +400,11 @@ async def interview_ws(ws: WebSocket) -> None:
             if mtype == "audio_chunk":
                 audio_b64 = str(msg.get("audio_b64") or "")
                 mime_type = str(msg.get("mime_type") or "audio/webm")
+                logger.info(
+                    "ws audio_chunk mime=%s b64_len=%s",
+                    mime_type,
+                    len(audio_b64),
+                )
                 text = await transcribe_audio_chunk(
                     app.state.http,
                     audio_b64=audio_b64,

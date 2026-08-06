@@ -323,3 +323,11 @@
     min-height: 260px;
   }
 }
+
+.debug-row {
+  font-size: 0.8rem;
+  opacity: 0.85;
+  margin-top: -8px;
+  margin-bottom: 12px;
+  word-break: break-word;
+}
