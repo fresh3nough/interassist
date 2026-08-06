@@ -21,7 +21,7 @@ Single-screen layout. Nothing is stored permanently.
 
 ```bash
 cd back
-python3 -m venv .venv
+/opt/homebrew/bin/python3.12 -m venv .venv  # needs 3.11/3.12 (not 3.14)
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # if needed
