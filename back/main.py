@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import json
+import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -24,6 +26,7 @@ logger = logging.getLogger("interassist")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.5")
+OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-1")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 SYSTEM_PROMPT = """You are InterAssist, a live coding interview co-pilot.
@@ -53,18 +56,20 @@ Rules:
 - Prefer practical, correct, concise output. No fluff.
 """
 
+NOISE_RE = re.compile(
+    r"^(thanks for watching[.!]?|thank you for watching[.!]?|subscribe[.!]?|"
+    r"please subscribe[.!]?|music|\[music\]|\(music\)|\.|\.\.\.|…)$",
+    re.I,
+)
+
 
 class AnalyzeRequest(BaseModel):
-    """HTTP fallback payload for transcript analysis."""
-
     transcript: str = Field(..., min_length=1)
     prior_code: str = ""
     model: str | None = None
 
 
 class AnalyzeResponse(BaseModel):
-    """Structured assistant output."""
-
     transcript_note: str = ""
     is_coding: bool = False
     is_question: bool = False
@@ -72,6 +77,15 @@ class AnalyzeResponse(BaseModel):
     talking_points: list[str] = Field(default_factory=list)
     code: dict[str, Any] = Field(default_factory=dict)
     model: str = ""
+
+
+def _headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:5173",
+        "X-Title": "InterAssist",
+    }
 
 
 def _empty_result(model: str) -> dict[str, Any]:
@@ -110,7 +124,12 @@ def _parse_model_json(raw: str, model: str) -> dict[str, Any]:
             result = _empty_result(model)
             result["transcript_note"] = "Model returned non-JSON output."
             return result
-        data = json.loads(text[start : end + 1])
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            result = _empty_result(model)
+            result["transcript_note"] = "Model returned non-JSON output."
+            return result
 
     base = _empty_result(model)
     base["transcript_note"] = str(data.get("transcript_note") or "")
@@ -131,13 +150,41 @@ def _parse_model_json(raw: str, model: str) -> dict[str, Any]:
     return base
 
 
+def _audio_format(mime_type: str) -> str:
+    mt = (mime_type or "").lower()
+    if "wav" in mt:
+        return "wav"
+    if "mpeg" in mt or "mp3" in mt:
+        return "mp3"
+    if "mp4" in mt or "m4a" in mt:
+        return "m4a"
+    if "ogg" in mt:
+        return "ogg"
+    if "flac" in mt:
+        return "flac"
+    if "aac" in mt:
+        return "aac"
+    return "webm"
+
+
+def _clean_transcript(text: str) -> str:
+    t = " ".join((text or "").split()).strip()
+    if not t:
+        return ""
+    if NOISE_RE.match(t):
+        return ""
+    # drop ultra-short garbage
+    if len(t) < 2:
+        return ""
+    return t
+
+
 async def call_openrouter(
     client: httpx.AsyncClient,
     transcript: str,
     prior_code: str = "",
     model: str | None = None,
 ) -> dict[str, Any]:
-    """Send transcript context to OpenRouter and return structured JSON."""
     selected = (model or OPENROUTER_MODEL).strip() or OPENROUTER_MODEL
     if not OPENROUTER_API_KEY:
         result = _empty_result(selected)
@@ -148,22 +195,12 @@ async def call_openrouter(
         "latest_transcript": transcript[-8000:],
         "prior_code": prior_code[-6000:] if prior_code else "",
     }
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5173",
-        "X-Title": "InterAssist",
-    }
     body = {
         "model": selected,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload),
-            },
+            {"role": "user", "content": json.dumps(user_payload)},
         ],
     }
 
@@ -176,24 +213,21 @@ async def call_openrouter(
         )
         resp = await client.post(
             f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
-            headers=headers,
+            headers=_headers(),
             json=body,
             timeout=60.0,
         )
         logger.info(
             "openrouter analyze status=%s body_preview=%s",
             resp.status_code,
-            (resp.text or "")[:500],
+            (resp.text or "")[:400],
         )
         resp.raise_for_status()
         payload = resp.json()
         content = payload["choices"][0]["message"]["content"]
-        logger.info(
-            "openrouter analyze content_preview=%s",
-            str(content)[:400],
-        )
+        logger.info("openrouter analyze content_preview=%s", str(content)[:400])
         return _parse_model_json(content, selected)
-    except Exception as exc:  # noqa: BLE001 - surface soft failure to UI
+    except Exception as exc:  # noqa: BLE001
         logger.exception("openrouter analyze failed: %s", exc)
         result = _empty_result(selected)
         result["transcript_note"] = f"OpenRouter error: {exc}"
@@ -204,96 +238,70 @@ async def transcribe_audio_chunk(
     client: httpx.AsyncClient,
     audio_b64: str,
     mime_type: str = "audio/webm",
-    model: str | None = None,
-) -> str:
-    """Best-effort audio transcription via OpenRouter multimodal chat."""
-    selected = (model or OPENROUTER_MODEL).strip() or OPENROUTER_MODEL
-    if not OPENROUTER_API_KEY or not audio_b64:
-        return ""
+    stt_model: str | None = None,
+) -> tuple[str, str | None]:
+    """Transcribe via OpenRouter STT endpoint. Returns (text, error_note)."""
+    selected = (stt_model or OPENROUTER_STT_MODEL).strip() or OPENROUTER_STT_MODEL
+    if not OPENROUTER_API_KEY:
+        return "", "OPENROUTER_API_KEY is missing."
+    if not audio_b64:
+        return "", "Empty audio chunk."
 
-    # Many OpenRouter models accept audio as an input_audio part.
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5173",
-        "X-Title": "InterAssist",
-    }
+    fmt = _audio_format(mime_type)
     body = {
         "model": selected,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Transcribe the interview audio. Return plain text only. "
-                    "No timestamps, no speaker labels unless clearly useful, no commentary."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Transcribe this audio chunk from a live interview.",
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": audio_b64,
-                            "format": "wav" if "wav" in mime_type else "webm",
-                        },
-                    },
-                ],
-            },
-        ],
+        "language": "en",
+        "input_audio": {
+            "data": audio_b64,
+            "format": fmt,
+        },
     }
 
     try:
         logger.info(
-            "openrouter transcribe model=%s audio_b64_len=%s mime=%s",
+            "openrouter stt model=%s audio_b64_len=%s mime=%s format=%s",
             selected,
             len(audio_b64 or ""),
             mime_type,
+            fmt,
         )
         resp = await client.post(
-            f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
-            headers=headers,
+            f"{OPENROUTER_BASE_URL.rstrip('/')}/audio/transcriptions",
+            headers=_headers(),
             json=body,
-            timeout=90.0,
+            timeout=60.0,
         )
-        logger.info(
-            "openrouter transcribe status=%s body_preview=%s",
-            resp.status_code,
-            (resp.text or "")[:500],
-        )
-        resp.raise_for_status()
+        preview = (resp.text or "")[:400]
+        logger.info("openrouter stt status=%s body_preview=%s", resp.status_code, preview)
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+                msg = (
+                    err.get("error", {}).get("message")
+                    if isinstance(err.get("error"), dict)
+                    else err.get("error") or err.get("message") or preview
+                )
+            except Exception:  # noqa: BLE001
+                msg = preview
+            return "", f"STT error {resp.status_code}: {msg}"
+
         payload = resp.json()
-        content = payload["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text") or ""))
-                else:
-                    parts.append(str(item))
-            text = " ".join(p.strip() for p in parts if p and str(p).strip()).strip()
-        else:
-            text = str(content or "").strip()
-        logger.info("openrouter transcribe text_preview=%s", text[:300])
-        return text
-    except Exception as exc:
-        logger.exception("openrouter transcribe failed: %s", exc)
-        return ""
+        text = _clean_transcript(str(payload.get("text") or ""))
+        logger.info("openrouter stt text=%s", text[:300] if text else "(empty)")
+        return text, None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("openrouter stt failed: %s", exc)
+        return "", f"STT exception: {exc}"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient()
+    app.state.http = httpx.AsyncClient(timeout=90.0)
     yield
     await app.state.http.aclose()
 
 
-app = FastAPI(title="InterAssist", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="InterAssist", version="0.1.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -308,6 +316,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": OPENROUTER_MODEL,
+        "stt_model": OPENROUTER_STT_MODEL,
         "has_key": bool(OPENROUTER_API_KEY),
     }
 
@@ -316,6 +325,7 @@ async def health() -> dict[str, Any]:
 async def config() -> dict[str, Any]:
     return {
         "default_model": OPENROUTER_MODEL,
+        "stt_model": OPENROUTER_STT_MODEL,
         "models": [
             "x-ai/grok-4.5",
             "x-ai/grok-4",
@@ -344,6 +354,48 @@ async def interview_ws(ws: WebSocket) -> None:
     full_transcript: list[str] = []
     prior_code = ""
     model = OPENROUTER_MODEL
+    stt_model = OPENROUTER_STT_MODEL
+    # serialize STT so chunks don't stampede OpenRouter
+    stt_lock = asyncio.Lock()
+    last_text = ""
+
+    async def analyze_and_send(text: str) -> None:
+        nonlocal prior_code, last_text
+        cleaned = _clean_transcript(text)
+        if not cleaned:
+            await ws.send_json(
+                {
+                    "type": "transcript_partial",
+                    "text": "",
+                    "note": "No speech detected in chunk",
+                }
+            )
+            return
+
+        # skip exact duplicates back-to-back
+        if cleaned.lower() == last_text.lower():
+            logger.info("skipping duplicate transcript: %s", cleaned[:120])
+            return
+        last_text = cleaned
+
+        full_transcript.append(cleaned)
+        joined = " ".join(full_transcript)[-12000:]
+        result = await call_openrouter(
+            app.state.http,
+            transcript=joined,
+            prior_code=prior_code,
+            model=model,
+        )
+        if result.get("code", {}).get("update") and result["code"].get("content"):
+            prior_code = result["code"]["content"]
+        await ws.send_json(
+            {
+                "type": "analysis",
+                "transcript": cleaned,
+                "full_transcript": joined,
+                **result,
+            }
+        )
 
     try:
         while True:
@@ -355,20 +407,24 @@ async def interview_ws(ws: WebSocket) -> None:
                 continue
 
             mtype = msg.get("type")
-            logger.info(
-                "ws recv type=%s keys=%s",
-                mtype,
-                list(msg.keys()),
-            )
+            logger.info("ws recv type=%s keys=%s", mtype, list(msg.keys()))
 
             if mtype == "config":
                 model = (msg.get("model") or model).strip() or model
-                await ws.send_json({"type": "config_ok", "model": model})
+                stt_model = (msg.get("stt_model") or stt_model).strip() or stt_model
+                await ws.send_json(
+                    {
+                        "type": "config_ok",
+                        "model": model,
+                        "stt_model": stt_model,
+                    }
+                )
                 continue
 
             if mtype == "reset":
                 full_transcript = []
                 prior_code = ""
+                last_text = ""
                 await ws.send_json({"type": "reset_ok"})
                 continue
 
@@ -377,24 +433,7 @@ async def interview_ws(ws: WebSocket) -> None:
                 logger.info("ws transcript text=%s", text[:300])
                 if not text:
                     continue
-                full_transcript.append(text)
-                joined = " ".join(full_transcript)[-12000:]
-                result = await call_openrouter(
-                    app.state.http,
-                    transcript=joined,
-                    prior_code=prior_code,
-                    model=model,
-                )
-                if result.get("code", {}).get("update") and result["code"].get("content"):
-                    prior_code = result["code"]["content"]
-                await ws.send_json(
-                    {
-                        "type": "analysis",
-                        "transcript": text,
-                        "full_transcript": joined,
-                        **result,
-                    }
-                )
+                await analyze_and_send(text)
                 continue
 
             if mtype == "audio_chunk":
@@ -405,48 +444,41 @@ async def interview_ws(ws: WebSocket) -> None:
                     mime_type,
                     len(audio_b64),
                 )
-                text = await transcribe_audio_chunk(
-                    app.state.http,
-                    audio_b64=audio_b64,
-                    mime_type=mime_type,
-                    model=model,
-                )
+                async with stt_lock:
+                    text, err = await transcribe_audio_chunk(
+                        app.state.http,
+                        audio_b64=audio_b64,
+                        mime_type=mime_type,
+                        stt_model=stt_model,
+                    )
+                if err:
+                    await ws.send_json(
+                        {
+                            "type": "transcript_partial",
+                            "text": "",
+                            "note": err,
+                        }
+                    )
+                    continue
                 if not text:
                     await ws.send_json(
                         {
                             "type": "transcript_partial",
                             "text": "",
-                            "note": "No transcript from audio chunk (model may not support audio).",
+                            "note": "No speech detected in audio chunk",
                         }
                     )
                     continue
-
-                full_transcript.append(text)
-                joined = " ".join(full_transcript)[-12000:]
-                result = await call_openrouter(
-                    app.state.http,
-                    transcript=joined,
-                    prior_code=prior_code,
-                    model=model,
-                )
-                if result.get("code", {}).get("update") and result["code"].get("content"):
-                    prior_code = result["code"]["content"]
-                await ws.send_json(
-                    {
-                        "type": "analysis",
-                        "transcript": text,
-                        "full_transcript": joined,
-                        **result,
-                    }
-                )
+                await analyze_and_send(text)
                 continue
 
             await ws.send_json({"type": "error", "message": f"Unknown type: {mtype}"})
     except WebSocketDisconnect:
+        logger.info("ws disconnected")
         return
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

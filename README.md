@@ -46,6 +46,7 @@ Open [http://localhost:5173](http://localhost:5173).
 ```env
 OPENROUTER_API_KEY=your_key
 OPENROUTER_MODEL=x-ai/grok-4.5
+OPENROUTER_STT_MODEL=openai/whisper-1
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
 
@@ -67,5 +68,5 @@ You can also type or paste lines into the transcript box if speech is unavailabl
 ## Notes
 
 - Chrome/Edge work best for live speech recognition.
-- If speech recognition is missing, the app falls back to short audio chunks sent to the model for transcription (depends on model audio support).
+- If browser speech fails (common `network` error), the app falls back to mic audio chunks transcribed via OpenRouter Whisper (`/audio/transcriptions`). Chat analysis still uses your selected model (default Grok 4.5).
 - No database. Session state lives in memory for the open WebSocket only.

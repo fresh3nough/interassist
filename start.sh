@@ -97,7 +97,7 @@ echo "==> starting backend  http://127.0.0.1:$BACK_PORT"
   cd "$BACK"
   # shellcheck disable=SC1091
   source .venv/bin/activate
-  exec uvicorn main:app --host 127.0.0.1 --port "$BACK_PORT" --reload
+  exec uvicorn main:app --host 127.0.0.1 --port "$BACK_PORT"
 ) >"$LOG_DIR/back.log" 2>&1 &
 BACK_PID=$!
 

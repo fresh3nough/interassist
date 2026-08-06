@@ -32,6 +32,36 @@ function logError(tag, payload) {
   else console.error(DBG, tag, payload)
 }
 
+function tsClock() {
+  const d = new Date()
+  return d.toLocaleTimeString('en-US', { hour12: false })
+}
+
+/** Anime/dub style subtitle lines in the console — words only. */
+function logSubtitle(kind, text) {
+  const line = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!line) return
+  const stamp = tsClock()
+  const styles = {
+    interim: 'color:#ffd6ef; background:#2a1030; font-size:14px; font-weight:700; padding:4px 10px; border-radius:8px; border-left:4px solid #ff7ad9',
+    final: 'color:#e8fff4; background:#0f2a22; font-size:15px; font-weight:800; padding:5px 12px; border-radius:8px; border-left:4px solid #35e0a1',
+    server: 'color:#eaf2ff; background:#101a33; font-size:15px; font-weight:800; padding:5px 12px; border-radius:8px; border-left:4px solid #6ea0ff',
+    manual: 'color:#fff7e6; background:#2a220f; font-size:15px; font-weight:800; padding:5px 12px; border-radius:8px; border-left:4px solid #ffc857',
+  }
+  const labels = {
+    interim: '⋯ LIVE',
+    final: '▶ LINE',
+    server: '字幕 SUB',
+    manual: '✎ TYPE',
+  }
+  const style = styles[kind] || styles.final
+  const label = labels[kind] || '▶ LINE'
+  // one styled line for the spoken words themselves
+  console.log(`%c${label}  ${stamp}  ${line}`, style)
+  // also dump plain words for easy copy/filter
+  console.log(line)
+}
+
 function wsUrl() {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const url = `${proto}://${window.location.host}/ws`
@@ -328,7 +358,7 @@ export default function App() {
       if (msg.type === 'analysis') {
         const chunk = (msg.transcript || '').trim()
         if (chunk) {
-          logInfo('[conversation][server]', chunk)
+          logSubtitle('server', chunk)
           setTranscript((prev) => (prev ? `${prev}\n${chunk}` : chunk))
           setLiveLine('')
         }
@@ -540,7 +570,7 @@ export default function App() {
           mimeType: recorder.mimeType,
           at: new Date().toISOString(),
         })
-        if (!event.data || size < 500) {
+        if (!event.data || size < 1500) {
           logWarn('[audio] chunk too small, skipping', { size, chunkIndex })
           return
         }
@@ -574,7 +604,7 @@ export default function App() {
       }
 
       // 3s slices — better for nearby loud speaker audio
-      recorder.start(3000)
+      recorder.start(5000)
       setStatus('Listening (audio chunks → model)')
       setListening(true)
       logInfo('[audio] fallback listening active')
@@ -643,29 +673,18 @@ export default function App() {
         heardCountRef.current += 1
         if (result.isFinal) {
           finalText += `${piece} `
-          logInfo('[heard:final]', {
-            n: heardCountRef.current,
-            text: piece.trim(),
-            confidence: best?.confidence,
-            alternatives: alts,
-            at: new Date().toISOString(),
-          })
+          logSubtitle('final', piece)
+          logInfo('[heard:meta]', { n: heardCountRef.current, confidence: best?.confidence, alternatives: alts })
         } else {
           interim += piece
-          logInfo('[heard:interim]', {
-            n: heardCountRef.current,
-            text: piece.trim(),
-            confidence: best?.confidence,
-            alternatives: alts,
-            at: new Date().toISOString(),
-          })
+          logSubtitle('interim', piece)
         }
       }
       if (interim) setLiveLine(interim.trim())
       const cleaned = finalText.trim()
       if (cleaned) {
         setLiveLine('')
-        logInfo('[conversation]', cleaned)
+        logSubtitle('final', cleaned)
         sendJson({ type: 'transcript', text: cleaned })
       }
     }
@@ -806,7 +825,7 @@ export default function App() {
   const submitManual = () => {
     const text = manualText.trim()
     if (!text) return
-    logInfo('[conversation][manual]', text)
+    logSubtitle('manual', text)
     const ok = sendJson({ type: 'transcript', text })
     if (!ok) logError('[manual] send failed')
     setManualText('')
