@@ -7,7 +7,22 @@ FRONT="$ROOT/front"
 BACK_PORT="${BACK_PORT:-8000}"
 FRONT_PORT="${FRONT_PORT:-5173}"
 LOG_DIR="$ROOT/.run"
+DAILY_LOG_DIR="$ROOT/logs"
+RUN_DATE="$(date +%F)"
+DAILY_LOG="$DAILY_LOG_DIR/$RUN_DATE.log"
 mkdir -p "$LOG_DIR"
+mkdir -p "$DAILY_LOG_DIR"
+: > "$LOG_DIR/back.log"
+: > "$LOG_DIR/front.log"
+
+start_daily_log_stream() {
+  local label="$1"
+  local source="$2"
+  tail -n +1 -F "$source" | while IFS= read -r line; do
+    printf '[%s] %s\n' "$label" "$line" >> "$DAILY_LOG"
+  done
+}
+
 
 # Prefer Homebrew Python 3.12 (system 3.14 breaks pydantic pins)
 if [[ -x /opt/homebrew/bin/python3.12 ]]; then
@@ -73,11 +88,21 @@ cleanup() {
   if [[ -n "${FRONT_PID:-}" ]] && kill -0 "$FRONT_PID" 2>/dev/null; then
     kill "$FRONT_PID" 2>/dev/null || true
   fi
+  for log_pid in "${BACK_LOG_PID:-}" "${FRONT_LOG_PID:-}" "${DAILY_TAIL_PID:-}"; do
+    if [[ -n "$log_pid" ]] && kill -0 "$log_pid" 2>/dev/null; then
+      kill "$log_pid" 2>/dev/null || true
+    fi
+  done
   # child process groups if any linger
   wait 2>/dev/null || true
   echo "==> stopped"
 }
 trap cleanup INT TERM EXIT
+
+start_daily_log_stream BACK "$LOG_DIR/back.log" &
+BACK_LOG_PID=$!
+start_daily_log_stream FRONT "$LOG_DIR/front.log" &
+FRONT_LOG_PID=$!
 
 # Free ports if stale processes hold them (best-effort)
 for port in "$BACK_PORT" "$FRONT_PORT"; do
@@ -138,19 +163,20 @@ echo "  UI:      http://127.0.0.1:$FRONT_PORT"
 echo "  API:     http://127.0.0.1:$BACK_PORT"
 echo "  health:  http://127.0.0.1:$BACK_PORT/api/health"
 echo "  logs:    $LOG_DIR/back.log  $LOG_DIR/front.log"
+echo "  daily:   $DAILY_LOG"
 echo
 echo "Press Ctrl+C to stop."
 echo
 
 # Stream logs while both stay up
-tail -n 0 -F "$LOG_DIR/back.log" "$LOG_DIR/front.log" &
-TAIL_PID=$!
+tail -n 0 -F "$DAILY_LOG" &
+DAILY_TAIL_PID=$!
 
 while kill -0 "$BACK_PID" 2>/dev/null && kill -0 "$FRONT_PID" 2>/dev/null; do
   sleep 1
 done
 
-kill "$TAIL_PID" 2>/dev/null || true
+kill "$DAILY_TAIL_PID" 2>/dev/null || true
 
 if ! kill -0 "$BACK_PID" 2>/dev/null; then
   echo "error: backend stopped — see $LOG_DIR/back.log"

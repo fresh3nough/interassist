@@ -16,6 +16,19 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+try:
+    from langdetect import DetectorFactory, detect_langs
+
+    DetectorFactory.seed = 0
+except ImportError:  # pragma: no cover - optional until dependencies are installed
+    detect_langs = None
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+    SENTIMENT_ANALYZER = SentimentIntensityAnalyzer()
+except ImportError:  # pragma: no cover - optional until dependencies are installed
+    SENTIMENT_ANALYZER = None
 
 load_dotenv()
 
@@ -60,10 +73,54 @@ Rules:
 - If transcript is only a greeting, still give friendly talking_points.
 """
 
+PERSONALIZATION_CONTEXT = """Candidate profile — use this context to tailor every response.
+
+Identity and links:
+- Name: Cody Wirth
+- Role: Software Engineer
+- Location: Newport Beach, California
+- LinkedIn: https://www.linkedin.com/in/codyrwirth
+- GitHub: https://github.com/fresh3nough
+- Email: codywirth903@gmail.com
+
+Resume and cover-letter experience:
+- Started in web development, progressed through a software engineering internship, and then full-time software engineering roles.
+- Shipped iPhone and Android applications, television applications for Samsung TV, Apple TV, and Fire TV/Firestick, plus frontend and backend e-commerce systems and APIs.
+- At Apollo Art, built an iPhone app, Android app, TV app, full e-commerce store, and C# backend APIs using Angular and Ionic. The work included deliberate gaming-influenced architecture choices and substantial hands-on integration and edge-case problem solving.
+- Strongest positioning: full-stack product engineering, cross-platform application delivery, backend/frontend integration, and practical ownership of difficult systems.
+
+Open-source work from the public GitHub profile:
+- Contributed to Zstandard (ZSTD), including fixing a SIGFPE crash in a compression path.
+- Shipped fixes and features across Docusaurus, React DevTools, Goose, Cashu, Meshtastic, Session, and other open-source projects.
+- Verified public activity includes work on React, block/buzz, Brave/adblock-rust, Goose, and the falcon project.
+- Themes to emphasize when relevant: protocol hacking, agent tooling, debugging, shared infrastructure, careful fixes, and making systems better for other developers.
+
+Personal interview framing:
+- Cody is motivated by curiosity, hacking, learning, problem solving, and building useful products.
+- Prefer concrete stories from Apollo Art for end-to-end ownership and from open source for debugging, collaboration, and production-quality maintenance.
+- Draft spoken interview answers in first person so Cody can say them directly.
+- Never invent an employer, title, metric, date, responsibility, technology, or LinkedIn detail that is not in this profile or the live conversation.
+- If a question asks for an unknown detail, say it is not in the available profile and suggest a truthful way for Cody to fill it in.
+"""
+
+SYSTEM_PROMPT += "\n\n" + PERSONALIZATION_CONTEXT
+
 NOISE_RE = re.compile(
     r"^(thanks for watching[.!]?|thank you for watching[.!]?|subscribe[.!]?|"
     r"please subscribe[.!]?|music|\[music\]|\(music\)|\.|\.\.\.|…)$",
     re.I,
+)
+FRAGMENT_PREFIX_RE = re.compile(
+    r"^(?:and|or|but|because|so|then|also|as|that|which)\b",
+    re.I,
+)
+QUESTION_START_RE = re.compile(
+    r"(?i)(?:^|[.!?]\s+)"
+    r"(?:what|why|how|when|where|who|which|can|could|would|do|did|are|is|"
+    r"have|has|tell|explain|describe|walk|give|show|please)\b"
+)
+REQUEST_START_RE = re.compile(
+    r"(?i)(?:^|[.!?]\s+)(?:build|write|implement|create|make)\b"
 )
 
 QUESTION_RE = re.compile(
@@ -71,10 +128,19 @@ QUESTION_RE = re.compile(
     r"\?|"
     r"\b(?:what|why|how|when|where|who|which|can you|could you|would you|do you|did you|"
     r"are you|is there|are there|tell me|explain|describe|walk me through|walk us through|"
-    r"give me|show me|define|difference between|compare|trade\-?offs?|complexit(?:y|ies)|"
+    r"give me|show me|build me|define|difference between|compare|trade\-?offs?|complexit(?:y|ies)|"
     r"big ?o|time complexity|space complexity|how would you|what would you|why did you|"
     r"have you|what's|whats|how does|how do|please explain)\b"
     r")"
+)
+QUESTION_ACK_RE = re.compile(
+    r"^(?:"
+    r"ok(?:ay)?|alright|all right|sure|yes|no|right|got it|understood|"
+    r"thanks?|thank you|bye(?:[ -]?bye)?|goodbye|great|awesome|perfect|"
+    r"sounds good|no problem|that is all|that's all|"
+    r"hello|hi|hey|yep|yeah|uh huh"
+    r")[.!?,\s]*$",
+    re.I,
 )
 
 FAST_ANSWER_PROMPT = """You answer coding-interview questions instantly for a candidate.
@@ -90,14 +156,71 @@ Rules:
 - Be direct. No preamble. No fluff.
 """
 
+FAST_ANSWER_PROMPT += (
+    "\n\n"
+    + PERSONALIZATION_CONTEXT
+    + "\nFor interview answers, prefer a concise first-person response grounded in Cody's actual experience."
+)
+
+
+def _question_evidence(text: str) -> tuple[bool, dict[str, Any]]:
+    t = (text or "").strip()
+    evidence: dict[str, Any] = {
+        "language": "unknown",
+        "language_probability": 0.0,
+        "sentiment_compound": 0.0,
+        "reason": "empty",
+    }
+    if not t:
+        return False, evidence
+    normalized = re.sub(r"[.!?,\s]+$", "", t).strip()
+    if not normalized:
+        evidence["reason"] = "empty_after_punctuation"
+        return False, evidence
+    if QUESTION_ACK_RE.fullmatch(t):
+        evidence["reason"] = "acknowledgement"
+        return False, evidence
+    if FRAGMENT_PREFIX_RE.match(normalized):
+        evidence["reason"] = "conjunction_fragment"
+        return False, evidence
+    if len(re.sub(r"[^a-z0-9]+", "", normalized.lower())) < 3:
+        evidence["reason"] = "too_short"
+        return False, evidence
+
+    if detect_langs is not None and len(re.findall(r"[A-Za-z]", t)) >= 20:
+        try:
+            detected = detect_langs(t)[0]
+            evidence["language"] = detected.lang
+            evidence["language_probability"] = round(float(detected.prob), 3)
+        except Exception:  # noqa: BLE001
+            pass
+    if SENTIMENT_ANALYZER is not None:
+        try:
+            evidence["sentiment_compound"] = round(
+                float(SENTIMENT_ANALYZER.polarity_scores(t)["compound"]), 3
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    if evidence["language"] not in {"unknown", "en"} and evidence["language_probability"] >= 0.8:
+        evidence["reason"] = "non_english"
+        return False, evidence
+    if "?" in t:
+        evidence["reason"] = "question_mark"
+        return True, evidence
+    if QUESTION_START_RE.search(t):
+        evidence["reason"] = "question_start"
+        return True, evidence
+    if REQUEST_START_RE.search(t):
+        evidence["reason"] = "request_start"
+        return True, evidence
+    evidence["reason"] = "no_question_structure"
+    return False, evidence
+
 
 def _looks_like_question(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    if "?" in t:
-        return True
-    return bool(QUESTION_RE.search(t))
+    accepted, _ = _question_evidence(text)
+    return accepted
 
 
 class AnalyzeRequest(BaseModel):
@@ -541,12 +664,58 @@ async def interview_ws(ws: WebSocket) -> None:
     prior_code = ""
     model = OPENROUTER_MODEL
     stt_model = OPENROUTER_STT_MODEL
-    stt_lock = asyncio.Lock()
-    analyze_lock = asyncio.Lock()
     last_text = ""
     last_analyze_at = 0.0
-    question_queue: asyncio.Queue[str] = asyncio.Queue()
+    connection_open = True
+    send_lock = asyncio.Lock()
+    audio_queue: asyncio.Queue[tuple[int, str, str]] = asyncio.Queue(maxsize=32)
+    transcript_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue(maxsize=64)
+    question_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=32)
     seen_questions: set[str] = set()
+    answered_questions: set[str] = set()
+    sequence = 0
+
+    async def publish_priority_answer(
+        question: str,
+        answer: str,
+        key_points: list[str] | None = None,
+        answer_model: str | None = None,
+    ) -> bool:
+        """Send one answer per question, even when full and fast analysis race."""
+        key = question.strip().lower()
+        if not answer.strip() or key in answered_questions:
+            return False
+        answered_questions.add(key)
+        if len(answered_questions) > 80:
+            answered_questions.pop()
+        await safe_send(
+            {
+                "type": "priority_answer",
+                "question": question,
+                "answer": answer.strip(),
+                "key_points": key_points or [],
+                "model": answer_model or model,
+                "queue_remaining": question_queue.qsize(),
+                "ts": time.time(),
+            }
+        )
+        return True
+
+    async def safe_send(payload: dict[str, Any]) -> bool:
+        """Serialize sends and ignore writes after the browser disconnects."""
+        nonlocal connection_open
+        if not connection_open:
+            return False
+        try:
+            async with send_lock:
+                if not connection_open:
+                    return False
+                await ws.send_json(payload)
+            return True
+        except (WebSocketDisconnect, RuntimeError, ConnectionError) as exc:
+            connection_open = False
+            logger.info("ws send skipped after disconnect: %s", exc)
+            return False
 
     async def priority_answer_worker() -> None:
         """Drain interview questions FIFO, one-by-one, as fast as possible."""
@@ -559,46 +728,49 @@ async def interview_ws(ws: WebSocket) -> None:
                     question_queue.qsize(),
                     qtext[:160],
                 )
-                await ws.send_json(
+                if qtext.strip().lower() in answered_questions:
+                    continue
+                await safe_send(
                     {
                         "type": "question_queued",
                         "question": qtext,
                         "queue_size": question_queue.qsize() + 1,
                     }
                 )
-                ans = await call_fast_answer(
-                    app.state.http,
-                    question_text=qtext,
-                    context=ctx,
-                    model=model,
-                )
-                await ws.send_json(
-                    {
-                        "type": "priority_answer",
-                        "question": ans.get("question") or qtext,
-                        "answer": ans.get("answer") or "",
-                        "key_points": ans.get("key_points") or [],
-                        "model": ans.get("model") or model,
-                        "queue_remaining": question_queue.qsize(),
-                        "ts": time.time(),
+                try:
+                    ans = await asyncio.wait_for(
+                        call_fast_answer(
+                            app.state.http,
+                            question_text=qtext,
+                            context=ctx,
+                            model=model,
+                        ),
+                        timeout=20.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("priority answer timed out q=%s", qtext[:160])
+                    ans = {
+                        "question": qtext,
+                        "answer": (
+                            "I heard the question, but the answer service timed out. "
+                            "Could you repeat it once?"
+                        ),
+                        "key_points": [],
+                        "model": model,
                     }
+                await publish_priority_answer(
+                    qtext,
+                    ans.get("answer") or "",
+                    ans.get("key_points") or [],
+                    ans.get("model") or model,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("priority answer worker failed: %s", exc)
-                try:
-                    await ws.send_json(
-                        {
-                            "type": "priority_answer",
-                            "question": qtext,
-                            "answer": f"Priority answer failed: {exc}",
-                            "key_points": [],
-                            "model": model,
-                            "queue_remaining": question_queue.qsize(),
-                            "ts": time.time(),
-                        }
+                if connection_open:
+                    logger.exception("priority answer worker failed: %s", exc)
+                    await publish_priority_answer(
+                        qtext,
+                        f"Priority answer failed: {exc}",
                     )
-                except Exception:  # noqa: BLE001
-                    pass
             finally:
                 question_queue.task_done()
 
@@ -606,7 +778,18 @@ async def interview_ws(ws: WebSocket) -> None:
 
     def enqueue_question(text: str) -> None:
         cleaned = _clean_transcript(text)
-        if not cleaned or not _looks_like_question(cleaned):
+        accepted, evidence = _question_evidence(cleaned)
+        logger.info(
+            "priority evidence accepted=%s language=%s language_probability=%s "
+            "sentiment=%s reason=%s text=%s",
+            accepted,
+            evidence["language"],
+            evidence["language_probability"],
+            evidence["sentiment_compound"],
+            evidence["reason"],
+            cleaned[:160],
+        )
+        if not cleaned or not accepted:
             return
         key = cleaned.lower()
         # allow same question again after a while by keeping only recent keys
@@ -621,7 +804,11 @@ async def interview_ws(ws: WebSocket) -> None:
                     seen_questions.pop()
                 except KeyError:
                     break
-        question_queue.put_nowait(cleaned)
+        try:
+            question_queue.put_nowait(cleaned)
+        except asyncio.QueueFull:
+            logger.warning("priority queue full; dropping question: %s", cleaned[:160])
+            return
         logger.info(
             "priority enqueued q_chars=%s queue_size=%s text=%s",
             len(cleaned),
@@ -633,7 +820,7 @@ async def interview_ws(ws: WebSocket) -> None:
         nonlocal prior_code, last_text, last_analyze_at
         cleaned = _clean_transcript(text)
         if not cleaned:
-            await ws.send_json(
+            await safe_send(
                 {
                     "type": "transcript_partial",
                     "text": "",
@@ -653,7 +840,7 @@ async def interview_ws(ws: WebSocket) -> None:
         # PRIORITY: questions jump the queue and get a dedicated fast answer path
         if _looks_like_question(cleaned):
             enqueue_question(cleaned)
-            await ws.send_json(
+            await safe_send(
                 {
                     "type": "question_detected",
                     "question": cleaned,
@@ -665,42 +852,114 @@ async def interview_ws(ws: WebSocket) -> None:
         if not force and (now - last_analyze_at) < 0.4:
             await asyncio.sleep(0.4)
 
-        async with analyze_lock:
-            last_analyze_at = time.time()
-            result = await call_openrouter(
-                app.state.http,
-                transcript=joined,
-                prior_code=prior_code,
-                model=model,
-                latest_chunk=cleaned,
-            )
-            if result.get("code", {}).get("content"):
-                if result["code"].get("update") or not prior_code:
-                    prior_code = result["code"]["content"]
-                    result["code"]["update"] = True
+        last_analyze_at = time.time()
+        result = await call_openrouter(
+            app.state.http,
+            transcript=joined,
+            prior_code=prior_code,
+            model=model,
+            latest_chunk=cleaned,
+        )
+        if result.get("code", {}).get("content"):
+            if result["code"].get("update") or not prior_code:
+                prior_code = result["code"]["content"]
+                result["code"]["update"] = True
 
-            # If detector missed it but full analysis flags a question, enqueue for priority box.
-            if result.get("is_question") or result.get("answer_flash"):
-                if cleaned.lower() not in seen_questions:
-                    q = cleaned if _looks_like_question(cleaned) else (cleaned.rstrip(".!") + "?")
-                    enqueue_question(q)
+        # If detector missed it but full analysis flags a question, enqueue for priority box.
+        if result.get("is_question") and _looks_like_question(cleaned):
+            if cleaned.lower() not in seen_questions:
+                enqueue_question(cleaned)
+            if result.get("answer_flash"):
+                await publish_priority_answer(
+                    cleaned,
+                    str(result["answer_flash"]),
+                    result.get("talking_points") or [],
+                    result.get("model") or model,
+                )
 
-            await ws.send_json(
-                {
-                    "type": "analysis",
-                    "transcript": cleaned,
-                    "full_transcript": joined,
-                    **result,
-                }
-            )
+        await safe_send(
+            {
+                "type": "analysis",
+                "transcript": cleaned,
+                "full_transcript": joined,
+                **result,
+            }
+        )
 
+    async def stt_worker() -> None:
+        """Transcribe accepted audio without blocking WebSocket ingestion."""
+        while True:
+            seq, audio_b64, mime_type = await audio_queue.get()
+            try:
+                text, err = await transcribe_audio_chunk(
+                    app.state.http,
+                    audio_b64=audio_b64,
+                    mime_type=mime_type,
+                    stt_model=stt_model,
+                )
+                if err:
+                    logger.warning("stt error seq=%s note=%s", seq, err)
+                    await safe_send(
+                        {
+                            "type": "transcript_partial",
+                            "text": "",
+                            "note": err,
+                            "sequence": seq,
+                        }
+                    )
+                elif text:
+                    await transcript_queue.put((seq, text))
+                else:
+                    await safe_send(
+                        {
+                            "type": "transcript_partial",
+                            "text": "",
+                            "note": "No speech detected in audio chunk",
+                            "sequence": seq,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("stt worker failed seq=%s: %s", seq, exc)
+                await safe_send(
+                    {
+                        "type": "transcript_partial",
+                        "text": "",
+                        "note": f"STT worker error: {exc}",
+                        "sequence": seq,
+                    }
+                )
+            finally:
+                audio_queue.task_done()
+
+    async def analysis_worker() -> None:
+        """Run slower full-panel analysis independently of incoming audio."""
+        while True:
+            seq, text = await transcript_queue.get()
+            try:
+                logger.info("analysis queue processing seq=%s text=%s", seq, text[:160])
+                await analyze_and_send(text, force=True)
+            except Exception as exc:  # noqa: BLE001
+                if connection_open:
+                    logger.exception("analysis worker failed seq=%s: %s", seq, exc)
+                    await safe_send(
+                        {
+                            "type": "error",
+                            "message": f"Analysis worker error: {exc}",
+                            "sequence": seq,
+                        }
+                    )
+            finally:
+                transcript_queue.task_done()
+
+    stt_task = asyncio.create_task(stt_worker())
+    analysis_task = asyncio.create_task(analysis_worker())
     try:
         while True:
             raw = await ws.receive_text()
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "message": "Invalid JSON"})
+                await safe_send({"type": "error", "message": "Invalid JSON"})
                 continue
 
             mtype = msg.get("type")
@@ -709,7 +968,7 @@ async def interview_ws(ws: WebSocket) -> None:
             if mtype == "config":
                 model = (msg.get("model") or model).strip() or model
                 stt_model = (msg.get("stt_model") or stt_model).strip() or stt_model
-                await ws.send_json(
+                await safe_send(
                     {
                         "type": "config_ok",
                         "model": model,
@@ -722,7 +981,9 @@ async def interview_ws(ws: WebSocket) -> None:
                 full_transcript = []
                 prior_code = ""
                 last_text = ""
-                await ws.send_json({"type": "reset_ok"})
+                seen_questions.clear()
+                answered_questions.clear()
+                await safe_send({"type": "reset_ok"})
                 continue
 
             if mtype == "transcript":
@@ -730,7 +991,8 @@ async def interview_ws(ws: WebSocket) -> None:
                 logger.info("ws transcript text=%s", text[:300])
                 if not text:
                     continue
-                await analyze_and_send(text, force=True)
+                sequence += 1
+                await transcript_queue.put((sequence, text))
                 continue
 
             if mtype == "audio_chunk":
@@ -741,44 +1003,31 @@ async def interview_ws(ws: WebSocket) -> None:
                     mime_type,
                     len(audio_b64),
                 )
-                async with stt_lock:
-                    text, err = await transcribe_audio_chunk(
-                        app.state.http,
-                        audio_b64=audio_b64,
-                        mime_type=mime_type,
-                        stt_model=stt_model,
-                    )
-                if err:
-                    logger.warning("stt error note=%s", err)
-                    await ws.send_json(
-                        {
-                            "type": "transcript_partial",
-                            "text": "",
-                            "note": err,
-                        }
+                if not audio_b64:
+                    await safe_send(
+                        {"type": "transcript_partial", "text": "", "note": "Empty audio chunk."}
                     )
                     continue
-                if not text:
-                    await ws.send_json(
-                        {
-                            "type": "transcript_partial",
-                            "text": "",
-                            "note": "No speech detected in audio chunk",
-                        }
-                    )
-                    continue
-                # Every Whisper transcript goes to Grok for live panel updates
-                await analyze_and_send(text, force=True)
+                sequence += 1
+                await audio_queue.put((sequence, audio_b64, mime_type))
+                await safe_send(
+                    {
+                        "type": "audio_queued",
+                        "sequence": sequence,
+                        "queue_size": audio_queue.qsize(),
+                    }
+                )
                 continue
 
-            await ws.send_json({"type": "error", "message": f"Unknown type: {mtype}"})
+            await safe_send({"type": "error", "message": f"Unknown type: {mtype}"})
     except WebSocketDisconnect:
         logger.info("ws disconnected")
-        worker_task.cancel()
-        return
     finally:
-        if not worker_task.done():
-            worker_task.cancel()
+        connection_open = False
+        for task in (worker_task, stt_task, analysis_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(worker_task, stt_task, analysis_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

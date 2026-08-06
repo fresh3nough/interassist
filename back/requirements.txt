@@ -5,3 +5,5 @@ httpx==0.28.1
 websockets==14.1
 pydantic==2.10.4
 pydantic-settings==2.7.0
+langdetect==1.0.9
+vaderSentiment==3.3.2

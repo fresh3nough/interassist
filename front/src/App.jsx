@@ -31,7 +31,28 @@ function logError(tag, payload) {
   if (payload === undefined) console.error(DBG, tag)
   else console.error(DBG, tag, payload)
 }
+function isActionablePriorityText(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return false
+  if (/^(?:ok(?:ay)?|alright|sure|yes|no|right|got it|understood|thanks?|thank you|bye(?:[ -]?bye)?|goodbye|great|awesome|perfect|sounds good|no problem|hello|hi|hey)[.!?,\s]*$/i.test(text)) {
+    return false
+  }
+  if (/^(?:and|or|but|because|so|then|also|as|that|which)\b/i.test(text)) return false
+  if (text.length < 3) return false
+  return (
+    text.includes('?') ||
+    /(?:^|[.!?]\s+)(?:what|why|how|when|where|who|which|can|could|would|do|did|are|is|have|has|tell|explain|describe|walk|give|show|please)\b/i.test(
+      text,
+    ) ||
+    /(?:^|[.!?]\s+)(?:build|write|implement|create|make)\b/i.test(text)
+  )
+}
 
+function samePriorityQuestion(left, right) {
+  const a = String(left || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  const b = String(right || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  return a === b || (a.length > 20 && b.length > 20 && (a.includes(b) || b.includes(a)))
+}
 function tsClock() {
   const d = new Date()
   return d.toLocaleTimeString('en-US', { hour12: false })
@@ -157,7 +178,7 @@ export default function App() {
   const mediaStreamRef = useRef(null)
   const shouldListenRef = useRef(false)
   const modelRef = useRef(model)
-  const transcriptEndRef = useRef(null)
+  const transcriptBodyRef = useRef(null)
   const usingSpeechRef = useRef(false)
   const audioFallbackStartedRef = useRef(false)
   const msgCountRef = useRef(0)
@@ -176,8 +197,17 @@ export default function App() {
   }, [model])
 
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const body = transcriptBodyRef.current
+    if (body) body.scrollTop = body.scrollHeight
   }, [transcript, liveLine])
+
+  const appendLiveTranscript = useCallback((previous, chunk) => {
+    const lines = `${previous ? `${previous}\n` : ''}${chunk}`
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+    return lines.slice(-60).join('\n')
+  }, [])
 
   useEffect(() => {
     logInfo('[boot]', {
@@ -365,7 +395,7 @@ export default function App() {
         const chunk = (msg.transcript || '').trim()
         if (chunk) {
           logSubtitle('server', chunk)
-          setTranscript((prev) => (prev ? `${prev}\n${chunk}` : chunk))
+          setTranscript((prev) => appendLiveTranscript(prev, chunk))
           setLiveLine('')
         }
         if (msg.summary) {
@@ -418,11 +448,14 @@ export default function App() {
       if (msg.type === 'question_detected' || msg.type === 'question_queued') {
         const q = String(msg.question || '').trim()
         logInfo('[priority] question event', msg)
-        if (q) {
+        if (q && isActionablePriorityText(q)) {
           setPendingQuestions((prev) => {
             if (prev.some((x) => x.toLowerCase() === q.toLowerCase())) return prev
             return [q, ...prev].slice(0, 8)
           })
+        } else if (q) {
+          logWarn('[priority] ignored non-question event', q)
+          return
         }
         if (typeof msg.queue_size === 'number') setQueueSize(msg.queue_size)
         setDebug(`Q priority queued (${msg.queue_size ?? '?'}): ${q.slice(0, 80)}`)
@@ -456,7 +489,7 @@ export default function App() {
             ]
             return next.slice(0, 12)
           })
-          setPendingQuestions((prev) => prev.filter((x) => x.toLowerCase() !== q.toLowerCase()))
+          setPendingQuestions((prev) => prev.filter((x) => !samePriorityQuestion(x, q)))
           setFlash(a)
           setFlashOn(true)
           window.setTimeout(() => setFlashOn(false), 9000)
@@ -489,7 +522,7 @@ export default function App() {
         setDebug(`server error: ${msg.message}`)
       }
     }
-  }, [sendJson, setDebug])
+  }, [appendLiveTranscript, sendJson, setDebug])
 
   useEffect(() => {
     connectWs()
@@ -1056,7 +1089,7 @@ export default function App() {
 
         {pendingQuestions.length ? (
           <div className="pending-row">
-            {pendingQuestions.map((q) => (
+            {pendingQuestions.slice(0, 4).map((q) => (
               <div key={q} className="pending-chip">
                 <span className="pending-dot" />
                 <strong>Answering…</strong> {q}
@@ -1067,7 +1100,7 @@ export default function App() {
 
         <div className="priority-list">
           {priorityAnswers.length ? (
-            priorityAnswers.map((item) => (
+            priorityAnswers.slice(0, 4).map((item) => (
               <article key={item.id} className="priority-card">
                 <div className="pq-label">Question</div>
                 <div className="pq-question">{item.question}</div>
@@ -1097,12 +1130,11 @@ export default function App() {
             <h2>Live transcript</h2>
             <span className="badge">{listening ? 'REC' : 'PAUSED'}</span>
           </div>
-          <div className="panel-body transcript-body">
+          <div className="panel-body transcript-body" ref={transcriptBodyRef}>
             {transcript || liveLine ? (
               <>
                 <pre>{transcript}</pre>
                 {liveLine ? <p className="interim">{liveLine}</p> : null}
-                <div ref={transcriptEndRef} />
               </>
             ) : (
               <p className="empty">
