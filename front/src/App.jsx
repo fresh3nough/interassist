@@ -140,6 +140,7 @@ export default function App() {
   const [transcript, setTranscript] = useState('')
   const [liveLine, setLiveLine] = useState('')
   const [talkingPoints, setTalkingPoints] = useState([])
+  const [summary, setSummary] = useState('')
   const [code, setCode] = useState({ language: '', filename: '', content: '' })
   const [flash, setFlash] = useState('')
   const [flashOn, setFlashOn] = useState(false)
@@ -158,6 +159,8 @@ export default function App() {
   const audioFallbackStartedRef = useRef(false)
   const msgCountRef = useRef(0)
   const heardCountRef = useRef(0)
+  const audioCycleTimerRef = useRef(null)
+  const audioChunkIndexRef = useRef(0)
 
   const setDebug = useCallback((line) => {
     setDebugLine(line)
@@ -362,11 +365,15 @@ export default function App() {
           setTranscript((prev) => (prev ? `${prev}\n${chunk}` : chunk))
           setLiveLine('')
         }
+        if (msg.summary) {
+          logInfo('[ai] summary', msg.summary)
+          setSummary(String(msg.summary))
+        }
         if (Array.isArray(msg.talking_points)) {
           logInfo('[ai] talking_points', msg.talking_points)
           setTalkingPoints(msg.talking_points)
         }
-        if (msg.code?.update && msg.code?.content) {
+        if (msg.code?.content && (msg.code?.update || msg.is_coding)) {
           logInfo('[ai] code draft update', {
             language: msg.code.language,
             filename: msg.code.filename,
@@ -385,11 +392,11 @@ export default function App() {
             contentLen: msg.code?.content?.length || 0,
           })
         }
-        if (msg.is_question && msg.answer_flash) {
+        if (msg.answer_flash) {
           logInfo('[ai] answer flash', msg.answer_flash)
           setFlash(msg.answer_flash)
           setFlashOn(true)
-          window.setTimeout(() => setFlashOn(false), 6500)
+          window.setTimeout(() => setFlashOn(false), 8000)
         }
         if (msg.transcript_note) {
           logWarn('[ai] transcript_note', msg.transcript_note)
@@ -470,6 +477,10 @@ export default function App() {
     shouldListenRef.current = false
     setListening(false)
     audioFallbackStartedRef.current = false
+    if (audioCycleTimerRef.current) {
+      clearTimeout(audioCycleTimerRef.current)
+      audioCycleTimerRef.current = null
+    }
     stopSpeechOnly()
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -500,7 +511,7 @@ export default function App() {
       return
     }
     audioFallbackStartedRef.current = true
-    logWarn('[audio] starting MediaRecorder fallback', { reason })
+    logWarn('[audio] starting complete-file MediaRecorder cycle', { reason })
     setDebug(`audio fallback: ${reason}`)
 
     try {
@@ -508,22 +519,33 @@ export default function App() {
         throw new Error('navigator.mediaDevices.getUserMedia unavailable')
       }
 
+      // Prefer a fresh stream for recording so speech probe stream is not reused oddly
+      if (mediaStreamRef.current) {
+        try {
+          mediaStreamRef.current.getTracks().forEach((tr) => tr.stop())
+        } catch {
+          /* ignore */
+        }
+        mediaStreamRef.current = null
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: true,
+          channelCount: 1,
         },
       })
       mediaStreamRef.current = stream
       const tracks = stream.getAudioTracks()
       logInfo('[audio] got stream', {
-        tracks: tracks.map((t) => ({
-          label: t.label,
-          enabled: t.enabled,
-          muted: t.muted,
-          readyState: t.readyState,
-          settings: t.getSettings?.(),
+        tracks: tracks.map((tr) => ({
+          label: tr.label,
+          enabled: tr.enabled,
+          muted: tr.muted,
+          readyState: tr.readyState,
+          settings: tr.getSettings?.(),
         })),
       })
 
@@ -537,45 +559,26 @@ export default function App() {
         'audio/mp4',
         'audio/ogg;codecs=opus',
       ]
-      const mimeType = candidates.find((t) => MediaRecorder.isTypeSupported(t)) || ''
+      const mimeType = candidates.find((x) => MediaRecorder.isTypeSupported(x)) || ''
       logInfo('[audio] MediaRecorder mime', {
         mimeType: mimeType || '(browser default)',
-        support: Object.fromEntries(candidates.map((t) => [t, MediaRecorder.isTypeSupported(t)])),
+        support: Object.fromEntries(candidates.map((x) => [x, MediaRecorder.isTypeSupported(x)])),
       })
 
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream)
-      mediaRecorderRef.current = recorder
-
-      let chunkIndex = 0
-      recorder.onstart = () => logInfo('[audio] recorder start', { state: recorder.state, mimeType: recorder.mimeType })
-      recorder.onstop = () => logInfo('[audio] recorder stop', { state: recorder.state })
-      recorder.onerror = (ev) => {
-        logError('[audio] recorder error', {
-          error: ev.error,
-          name: ev.error?.name,
-          message: ev.error?.message,
-        })
-        setError(`MediaRecorder error: ${ev.error?.message || ev.error?.name || 'unknown'}`)
-      }
-
-      recorder.ondataavailable = async (event) => {
-        chunkIndex += 1
-        const size = event.data?.size || 0
-        logInfo('[audio] dataavailable', {
-          chunkIndex,
+      const sendBlob = async (blob, idx) => {
+        const size = blob?.size || 0
+        logInfo('[audio] complete clip ready', {
+          chunkIndex: idx,
           bytes: size,
-          type: event.data?.type,
-          mimeType: recorder.mimeType,
+          type: blob?.type,
           at: new Date().toISOString(),
         })
-        if (!event.data || size < 1500) {
-          logWarn('[audio] chunk too small, skipping', { size, chunkIndex })
+        if (!blob || size < 2000) {
+          logWarn('[audio] clip too small, skipping', { size, chunkIndex: idx })
           return
         }
         try {
-          const buf = await event.data.arrayBuffer()
+          const buf = await blob.arrayBuffer()
           const bytes = new Uint8Array(buf)
           let binary = ''
           const step = 0x8000
@@ -583,31 +586,90 @@ export default function App() {
             binary += String.fromCharCode(...bytes.subarray(i, i + step))
           }
           const audio_b64 = btoa(binary)
-          logInfo('[audio] sending chunk to backend', {
-            chunkIndex,
+          logInfo('[audio] sending complete clip', {
+            chunkIndex: idx,
             bytes: bytes.length,
             b64len: audio_b64.length,
+            header: Array.from(bytes.slice(0, 4)),
           })
           const ok = sendJson({
             type: 'audio_chunk',
             audio_b64,
-            mime_type: recorder.mimeType || mimeType || 'audio/webm',
+            mime_type: blob.type || mimeType || 'audio/webm',
           })
-          if (!ok) logError('[audio] failed to queue chunk on ws', { chunkIndex })
+          if (!ok) logError('[audio] failed to queue clip on ws', { chunkIndex: idx })
         } catch (err) {
-          logError('[audio] chunk processing failed', {
-            chunkIndex,
+          logError('[audio] clip processing failed', {
+            chunkIndex: idx,
             err: String(err),
             stack: err?.stack,
           })
         }
       }
 
-      // 3s slices — better for nearby loud speaker audio
-      recorder.start(5000)
-      setStatus('Listening (audio chunks → model)')
+      const startCycle = () => {
+        if (!shouldListenRef.current || !mediaStreamRef.current) return
+        const parts = []
+        let recorder
+        try {
+          recorder = mimeType
+            ? new MediaRecorder(mediaStreamRef.current, { mimeType })
+            : new MediaRecorder(mediaStreamRef.current)
+        } catch (err) {
+          logError('[audio] MediaRecorder construct failed', err)
+          return
+        }
+        mediaRecorderRef.current = recorder
+
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) parts.push(event.data)
+        }
+
+        recorder.onerror = (ev) => {
+          logError('[audio] recorder error', {
+            error: ev.error,
+            name: ev.error?.name,
+            message: ev.error?.message,
+          })
+          setError(`MediaRecorder error: ${ev.error?.message || ev.error?.name || 'unknown'}`)
+        }
+
+        recorder.onstop = async () => {
+          const idx = ++audioChunkIndexRef.current
+          const type = recorder.mimeType || mimeType || 'audio/webm'
+          const blob = new Blob(parts, { type })
+          await sendBlob(blob, idx)
+          // schedule next complete clip
+          if (shouldListenRef.current && audioFallbackStartedRef.current) {
+            audioCycleTimerRef.current = window.setTimeout(startCycle, 50)
+          }
+        }
+
+        try {
+          // NO timeslice — one complete file per cycle (fixes Whisper 400s on partial webm)
+          recorder.start()
+          logInfo('[audio] cycle started', { state: recorder.state, mimeType: recorder.mimeType })
+        } catch (err) {
+          logError('[audio] recorder.start failed', err)
+          return
+        }
+
+        audioCycleTimerRef.current = window.setTimeout(() => {
+          if (recorder.state === 'recording') {
+            try {
+              recorder.requestData?.()
+              recorder.stop()
+            } catch (err) {
+              logWarn('[audio] stop cycle threw', err)
+            }
+          }
+        }, 5000)
+      }
+
+      startCycle()
+      setStatus('Listening (Whisper every 5s → Grok live)')
       setListening(true)
-      logInfo('[audio] fallback listening active')
+      logInfo('[audio] fallback listening active — complete clips every 5s')
     } catch (err) {
       audioFallbackStartedRef.current = false
       logError('[audio] fallback failed', {
@@ -784,18 +846,17 @@ export default function App() {
       // Keep stream for level / fallback; speech API uses its own capture too
       mediaStreamRef.current = probe
 
-      const usedSpeech = startBrowserSpeech()
-      if (!usedSpeech) {
-        logWarn('[mic] speech unavailable — using audio fallback immediately')
-        await startAudioFallback('no-speech-api')
-      } else {
-        // Also start audio fallback in parallel after a short delay if speech is quiet,
-        // but only auto-switch on speech network errors (handled in onerror).
-        setStatus('Listening (live speech)')
-        setListening(true)
-        setDebug('listening via Web Speech API')
-        logInfo('[mic] listening via Web Speech API (nearby speaker audio should appear as interim/final logs)')
+      // Prefer complete 5s Whisper clips for reliable nearby-speaker capture.
+      // Web Speech API is flaky (network errors) and often misses continuous audio.
+      logWarn('[mic] starting Whisper complete-clip mode (primary)')
+      // stop probe tracks; startAudioFallback opens a fresh optimized stream
+      try {
+        probe.getTracks().forEach((tr) => tr.stop())
+      } catch {
+        /* ignore */
       }
+      mediaStreamRef.current = null
+      await startAudioFallback('primary-whisper-cycle')
     } catch (err) {
       shouldListenRef.current = false
       setListening(false)
@@ -815,6 +876,7 @@ export default function App() {
     setTranscript('')
     setLiveLine('')
     setTalkingPoints([])
+    setSummary('')
     setCode({ language: '', filename: '', content: '' })
     setFlash('')
     setFlashOn(false)
@@ -955,6 +1017,12 @@ export default function App() {
             <h2>Talking points</h2>
           </div>
           <div className="panel-body">
+            {summary ? (
+              <div className="summary-box">
+                <div className="summary-label">Live summary</div>
+                <pre className="summary-text">{summary}</pre>
+              </div>
+            ) : null}
             {talkingPoints.length ? (
               <ul>
                 {talkingPoints.map((p) => (

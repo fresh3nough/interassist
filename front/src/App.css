@@ -331,3 +331,27 @@
   margin-bottom: 12px;
   word-break: break-word;
 }
+
+.summary-box {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(91, 140, 255, 0.08);
+  border: 1px solid rgba(110, 160, 255, 0.25);
+}
+.summary-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #9dbcff;
+  margin-bottom: 6px;
+  font-weight: 700;
+}
+.summary-text {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  color: #d7e7ff;
+}

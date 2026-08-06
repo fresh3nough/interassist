@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -29,31 +30,34 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.5")
 OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-1")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
-SYSTEM_PROMPT = """You are InterAssist, a live coding interview co-pilot.
-You receive rolling transcript chunks from an interview conversation.
+SYSTEM_PROMPT = """You are InterAssist, a live coding-interview co-pilot agent.
+You receive the rolling conversation transcript from Whisper speech-to-text.
+
+Every time you are called, refresh ALL panels for the candidate RIGHT NOW based on the latest transcript.
 
 Respond with ONLY valid JSON (no markdown fences) using this exact shape:
 {
-  "transcript_note": "optional short clarification or empty string",
+  "transcript_note": "one short status line about what just happened, or empty",
+  "summary": "2-4 concise bullets of the conversation so far, rewritten fresh each time",
   "is_coding": true or false,
   "is_question": true or false,
-  "answer_flash": "short direct answer if a question was asked, else empty string",
-  "talking_points": ["bullet", "bullet"],
+  "answer_flash": "if interviewer asked anything answerable, put a crisp interview-ready answer here; else empty string",
+  "talking_points": ["max 5 short next things the candidate should say NOW"],
   "code": {
     "language": "python|javascript|typescript|go|etc or empty",
     "filename": "suggested filename or empty",
-    "content": "full code draft or empty string",
+    "content": "best current full code draft for the coding task, or empty",
     "update": true or false
   }
 }
 
 Rules:
-- is_coding true when the conversation is about writing/debugging/designing code.
-- Only put code in code.content when is_coding is true and there is enough signal to draft something useful.
-- code.update true only when the code draft should replace the previous one.
-- answer_flash must be concise and interview-ready when is_question is true.
-- talking_points are things the candidate can say next (max 5 short bullets).
-- Prefer practical, correct, concise output. No fluff.
+- Always refresh talking_points from the latest conversation (even small chit-chat).
+- is_question true for any interviewer question, prompt, or request. Fill answer_flash whenever helpful.
+- is_coding true when coding/algorithms/system design/debugging is in play.
+- When coding is discussed, keep evolving code.content and set update true whenever the draft changes.
+- Prefer practical, correct, concise output. No fluff. No markdown fences outside JSON.
+- If transcript is only a greeting, still give friendly talking_points.
 """
 
 NOISE_RE = re.compile(
@@ -71,6 +75,7 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     transcript_note: str = ""
+    summary: str = ""
     is_coding: bool = False
     is_question: bool = False
     answer_flash: str = ""
@@ -91,6 +96,7 @@ def _headers() -> dict[str, str]:
 def _empty_result(model: str) -> dict[str, Any]:
     return {
         "transcript_note": "",
+        "summary": "",
         "is_coding": False,
         "is_question": False,
         "answer_flash": "",
@@ -133,6 +139,7 @@ def _parse_model_json(raw: str, model: str) -> dict[str, Any]:
 
     base = _empty_result(model)
     base["transcript_note"] = str(data.get("transcript_note") or "")
+    base["summary"] = str(data.get("summary") or "")
     base["is_coding"] = bool(data.get("is_coding"))
     base["is_question"] = bool(data.get("is_question"))
     base["answer_flash"] = str(data.get("answer_flash") or "")
@@ -141,11 +148,13 @@ def _parse_model_json(raw: str, model: str) -> dict[str, Any]:
         base["talking_points"] = [str(p).strip() for p in points if str(p).strip()][:5]
     code = data.get("code") or {}
     if isinstance(code, dict):
+        content = str(code.get("content") or "")
         base["code"] = {
             "language": str(code.get("language") or ""),
             "filename": str(code.get("filename") or ""),
-            "content": str(code.get("content") or ""),
-            "update": bool(code.get("update")),
+            "content": content,
+            # if model forgot update flag but sent content, treat as update
+            "update": bool(code.get("update")) or bool(content.strip()),
         }
     return base
 
@@ -173,8 +182,7 @@ def _clean_transcript(text: str) -> str:
         return ""
     if NOISE_RE.match(t):
         return ""
-    # drop ultra-short garbage
-    if len(t) < 2:
+    if len(t) < 1:
         return ""
     return t
 
@@ -184,6 +192,7 @@ async def call_openrouter(
     transcript: str,
     prior_code: str = "",
     model: str | None = None,
+    latest_chunk: str = "",
 ) -> dict[str, Any]:
     selected = (model or OPENROUTER_MODEL).strip() or OPENROUTER_MODEL
     if not OPENROUTER_API_KEY:
@@ -192,12 +201,17 @@ async def call_openrouter(
         return result
 
     user_payload = {
-        "latest_transcript": transcript[-8000:],
-        "prior_code": prior_code[-6000:] if prior_code else "",
+        "latest_chunk": latest_chunk[-2000:],
+        "full_transcript": transcript[-12000:],
+        "prior_code": prior_code[-8000:] if prior_code else "",
+        "instruction": (
+            "Update talking_points, answer_flash, summary, and code draft now "
+            "from this live interview transcript."
+        ),
     }
     body = {
         "model": selected,
-        "temperature": 0.2,
+        "temperature": 0.3,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(user_payload)},
@@ -206,27 +220,37 @@ async def call_openrouter(
 
     try:
         logger.info(
-            "openrouter analyze model=%s transcript_chars=%s prior_code_chars=%s",
+            "openrouter analyze model=%s transcript_chars=%s chunk_chars=%s prior_code_chars=%s",
             selected,
             len(transcript or ""),
+            len(latest_chunk or ""),
             len(prior_code or ""),
         )
         resp = await client.post(
             f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
             headers=_headers(),
             json=body,
-            timeout=60.0,
+            timeout=90.0,
         )
         logger.info(
             "openrouter analyze status=%s body_preview=%s",
             resp.status_code,
-            (resp.text or "")[:400],
+            (resp.text or "")[:500],
         )
         resp.raise_for_status()
         payload = resp.json()
         content = payload["choices"][0]["message"]["content"]
-        logger.info("openrouter analyze content_preview=%s", str(content)[:400])
-        return _parse_model_json(content, selected)
+        # some providers put reasoning separately; content can be delayed/empty string with whitespace
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    parts.append(str(item))
+            content = "\n".join(parts)
+        logger.info("openrouter analyze content_preview=%s", str(content)[:500])
+        return _parse_model_json(str(content or ""), selected)
     except Exception as exc:  # noqa: BLE001
         logger.exception("openrouter analyze failed: %s", exc)
         result = _empty_result(selected)
@@ -240,7 +264,7 @@ async def transcribe_audio_chunk(
     mime_type: str = "audio/webm",
     stt_model: str | None = None,
 ) -> tuple[str, str | None]:
-    """Transcribe via OpenRouter STT endpoint. Returns (text, error_note)."""
+    """Transcribe via OpenRouter STT. Returns (text, error_note)."""
     selected = (stt_model or OPENROUTER_STT_MODEL).strip() or OPENROUTER_STT_MODEL
     if not OPENROUTER_API_KEY:
         return "", "OPENROUTER_API_KEY is missing."
@@ -248,9 +272,14 @@ async def transcribe_audio_chunk(
         return "", "Empty audio chunk."
 
     fmt = _audio_format(mime_type)
+    url = f"{OPENROUTER_BASE_URL.rstrip('/')}/audio/transcriptions"
+    headers = _headers()
+
+    # Prefer JSON base64 path first
     body = {
         "model": selected,
         "language": "en",
+        "temperature": 0,
         "input_audio": {
             "data": audio_b64,
             "format": fmt,
@@ -265,14 +294,47 @@ async def transcribe_audio_chunk(
             mime_type,
             fmt,
         )
-        resp = await client.post(
-            f"{OPENROUTER_BASE_URL.rstrip('/')}/audio/transcriptions",
-            headers=_headers(),
-            json=body,
-            timeout=60.0,
-        )
-        preview = (resp.text or "")[:400]
+        resp = await client.post(url, headers=headers, json=body, timeout=60.0)
+        preview = (resp.text or "")[:500]
         logger.info("openrouter stt status=%s body_preview=%s", resp.status_code, preview)
+
+        # Fallback: multipart file upload if JSON path fails with 400
+        if resp.status_code >= 400:
+            try:
+                import base64
+
+                raw = base64.b64decode(audio_b64)
+                ext = fmt if fmt != "webm" else "webm"
+                files = {
+                    "file": (f"clip.{ext}", raw, mime_type or f"audio/{ext}"),
+                }
+                data = {
+                    "model": selected,
+                    "language": "en",
+                    "temperature": "0",
+                }
+                mp_headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "http://localhost:5173",
+                    "X-Title": "InterAssist",
+                }
+                logger.info("openrouter stt retry multipart bytes=%s", len(raw))
+                resp = await client.post(
+                    url,
+                    headers=mp_headers,
+                    data=data,
+                    files=files,
+                    timeout=60.0,
+                )
+                preview = (resp.text or "")[:500]
+                logger.info(
+                    "openrouter stt multipart status=%s body_preview=%s",
+                    resp.status_code,
+                    preview,
+                )
+            except Exception as mp_exc:  # noqa: BLE001
+                logger.exception("multipart stt failed: %s", mp_exc)
+
         if resp.status_code >= 400:
             try:
                 err = resp.json()
@@ -296,12 +358,12 @@ async def transcribe_audio_chunk(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(timeout=90.0)
+    app.state.http = httpx.AsyncClient(timeout=120.0)
     yield
     await app.state.http.aclose()
 
 
-app = FastAPI(title="InterAssist", version="0.1.1", lifespan=lifespan)
+app = FastAPI(title="InterAssist", version="0.1.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -344,6 +406,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         transcript=req.transcript,
         prior_code=req.prior_code,
         model=req.model,
+        latest_chunk=req.transcript,
     )
     return AnalyzeResponse(**data)
 
@@ -355,12 +418,13 @@ async def interview_ws(ws: WebSocket) -> None:
     prior_code = ""
     model = OPENROUTER_MODEL
     stt_model = OPENROUTER_STT_MODEL
-    # serialize STT so chunks don't stampede OpenRouter
     stt_lock = asyncio.Lock()
+    analyze_lock = asyncio.Lock()
     last_text = ""
+    last_analyze_at = 0.0
 
-    async def analyze_and_send(text: str) -> None:
-        nonlocal prior_code, last_text
+    async def analyze_and_send(text: str, force: bool = False) -> None:
+        nonlocal prior_code, last_text, last_analyze_at
         cleaned = _clean_transcript(text)
         if not cleaned:
             await ws.send_json(
@@ -372,30 +436,43 @@ async def interview_ws(ws: WebSocket) -> None:
             )
             return
 
-        # skip exact duplicates back-to-back
-        if cleaned.lower() == last_text.lower():
-            logger.info("skipping duplicate transcript: %s", cleaned[:120])
+        # always append new non-empty speech; allow near-duplicates if force
+        if cleaned.lower() == last_text.lower() and not force:
+            logger.info("skipping exact duplicate transcript: %s", cleaned[:120])
+            # still nudge analysis periodically on silence-ish repeats? no
             return
-        last_text = cleaned
 
+        last_text = cleaned
         full_transcript.append(cleaned)
         joined = " ".join(full_transcript)[-12000:]
-        result = await call_openrouter(
-            app.state.http,
-            transcript=joined,
-            prior_code=prior_code,
-            model=model,
-        )
-        if result.get("code", {}).get("update") and result["code"].get("content"):
-            prior_code = result["code"]["content"]
-        await ws.send_json(
-            {
-                "type": "analysis",
-                "transcript": cleaned,
-                "full_transcript": joined,
-                **result,
-            }
-        )
+
+        # throttle analyze slightly if bursts, but never drop more than ~1.5s
+        now = time.time()
+        if not force and (now - last_analyze_at) < 0.4:
+            await asyncio.sleep(0.4)
+
+        async with analyze_lock:
+            last_analyze_at = time.time()
+            result = await call_openrouter(
+                app.state.http,
+                transcript=joined,
+                prior_code=prior_code,
+                model=model,
+                latest_chunk=cleaned,
+            )
+            if result.get("code", {}).get("content"):
+                # keep evolving draft even if update flag flaky
+                if result["code"].get("update") or not prior_code:
+                    prior_code = result["code"]["content"]
+                    result["code"]["update"] = True
+            await ws.send_json(
+                {
+                    "type": "analysis",
+                    "transcript": cleaned,
+                    "full_transcript": joined,
+                    **result,
+                }
+            )
 
     try:
         while True:
@@ -433,7 +510,7 @@ async def interview_ws(ws: WebSocket) -> None:
                 logger.info("ws transcript text=%s", text[:300])
                 if not text:
                     continue
-                await analyze_and_send(text)
+                await analyze_and_send(text, force=True)
                 continue
 
             if mtype == "audio_chunk":
@@ -452,6 +529,7 @@ async def interview_ws(ws: WebSocket) -> None:
                         stt_model=stt_model,
                     )
                 if err:
+                    logger.warning("stt error note=%s", err)
                     await ws.send_json(
                         {
                             "type": "transcript_partial",
@@ -469,7 +547,8 @@ async def interview_ws(ws: WebSocket) -> None:
                         }
                     )
                     continue
-                await analyze_and_send(text)
+                # Every Whisper transcript goes to Grok for live panel updates
+                await analyze_and_send(text, force=True)
                 continue
 
             await ws.send_json({"type": "error", "message": f"Unknown type: {mtype}"})
